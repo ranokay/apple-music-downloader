@@ -16,7 +16,14 @@ func GetPlaylistResp(storefront string, id string, language string, token string
 			return nil, err
 		}
 	}
+	obj, err := getPlaylistRespWithInclude(storefront, id, language, token, "artists,albums")
+	if err == nil {
+		return obj, nil
+	}
+	return getPlaylistRespWithInclude(storefront, id, language, token, "artists")
+}
 
+func getPlaylistRespWithInclude(storefront string, id string, language string, token string, includeSongs string) (*PlaylistResp, error) {
 	req, err := http.NewRequest("GET", fmt.Sprintf("https://amp-api.music.apple.com/v1/catalog/%s/playlists/%s", storefront, id), nil)
 	if err != nil {
 		return nil, err
@@ -27,7 +34,7 @@ func GetPlaylistResp(storefront string, id string, language string, token string
 	query := url.Values{}
 	query.Set("omit[resource]", "autos")
 	query.Set("include", "tracks,artists,record-labels")
-	query.Set("include[songs]", "artists")
+	query.Set("include[songs]", includeSongs)
 	//query.Set("fields[artists]", "name,artwork")
 	//query.Set("fields[albums:albums]", "artistName,artwork,name,releaseDate,url")
 	//query.Set("fields[record-labels]", "name")
@@ -49,6 +56,10 @@ func GetPlaylistResp(storefront string, id string, language string, token string
 	}
 	if len(obj.Data[0].Relationships.Tracks.Next) > 0 {
 		next := obj.Data[0].Relationships.Tracks.Next
+		includeTracks := "artists"
+		if includeSongs == "artists,albums" {
+			includeTracks = "artists,albums"
+		}
 		for {
 			req, err := http.NewRequest("GET", fmt.Sprintf("https://amp-api.music.apple.com%s", next), nil)
 			if err != nil {
@@ -59,7 +70,7 @@ func GetPlaylistResp(storefront string, id string, language string, token string
 			req.Header.Set("Origin", "https://music.apple.com")
 			query := req.URL.Query()
 			query.Set("omit[resource]", "autos")
-			query.Set("include", "artists")
+			query.Set("include", includeTracks)
 			query.Set("extend", "editorialVideo,extendedAssetUrls")
 			req.URL.RawQuery = query.Encode()
 			do, err := http.DefaultClient.Do(req)
