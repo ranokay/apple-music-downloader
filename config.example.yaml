@@ -1,0 +1,114 @@
+media-user-token: your-media-user-token
+authorization-token: your-authorization-token
+language: en-gb&l%5Bscript%5D=en-Latn
+lrc-type: syllable-lyrics
+lrc-format: ttml
+embed-lrc: false
+save-lrc-file: true
+save-artist-cover: true
+save-animated-artwork: true
+emby-animated-artwork: false
+embed-cover: false
+save-cover-file: true
+cover-size: 5000x5000
+cover-format: original
+alac-save-folder: /Users/ranokay/Downloads/apple-music-rip/downloads/alac
+atmos-save-folder: /Users/ranokay/Downloads/apple-music-rip/downloads/atmos
+aac-save-folder: /Users/ranokay/Downloads/apple-music-rip/downloads/aac
+max-memory-limit: 2048
+decrypt-m3u8-port: 127.0.0.1:10020
+get-m3u8-port: 127.0.0.1:20020
+get-m3u8-from-device: true
+get-m3u8-mode: web
+aac-type: aac-lc
+alac-max: 192000
+atmos-max: 2768
+limit-max: 300
+album-folder-format: "[{ReleaseYear}] - {AlbumName}"
+playlist-folder-format: "{PlaylistName}"
+song-file-format: "{SongNumer} - {SongName}"
+artist-folder-format: "{UrlArtistName}"
+explicit-choice: "[E]"
+clean-choice: "[C]"
+apple-master-choice: "[M]"
+use-songinfo-for-playlist: true
+dl-albumcover-for-playlist: false
+mv-audio-type: atmos
+mv-max: 2160
+storefront: ""
+convert-after-download: true
+convert-format: flac
+convert-formats:
+  - lossless
+  - hires
+convert-keep-original: false
+convert-skip-if-source-matches: true
+alac-repair-mode: corrupt-only
+ffmpeg-path: ffmpeg
+convert-extra-args: ""
+convert-warn-lossy-to-lossless: true
+convert-skip-lossy-to-lossless: true
+metadata-tags-m4a:
+  - title
+  - title_sort
+  - artist
+  - artist_sort
+  - album
+  - album_sort
+  - album_artist
+  - album_artist_sort
+  - composer
+  - composer_sort
+  - genre
+  - track_number
+  - track_total
+  - disc_number
+  - disc_total
+  - release_date
+  - release_type
+  - isrc
+  - upc
+  - label
+  - publisher
+  - copyright
+  - advisory
+  - itunes_album_id
+  - itunes_artist_id
+  - album_version
+  - performer
+metadata-tags-flac:
+  - title
+  - title_sort
+  - artist
+  - artist_sort
+  - album
+  - album_sort
+  - album_artist
+  - album_artist_sort
+  - composer
+  - composer_sort
+  - genre
+  - track_number
+  - track_total
+  - disc_number
+  - disc_total
+  - release_date
+  - original_date
+  - release_type
+  - isrc
+  - upc
+  - label
+  - publisher
+  - copyright
+  - advisory
+  - album_version
+  - performer
+  - loudness
+metadata-atmos-prefix: true
+metadata-custom-tag-rules:
+  - key: ALBUMVERSION
+    value: Dolby Atmos
+    containers:
+      - m4a
+    source-formats:
+      - atmos

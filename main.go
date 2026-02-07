@@ -15,9 +15,11 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -37,28 +39,131 @@ import (
 	"gopkg.in/yaml.v2"
 )
 
+const (
+	envMetadataTagsM4a     = "AMR_METADATA_TAGS_M4A"
+	envMetadataTagsFlac    = "AMR_METADATA_TAGS_FLAC"
+	envSourceFormat        = "AMR_SOURCE_FORMAT"
+	maxCustomMetadataTags  = 30
+	maxCustomMetadataValue = 512
+	atmosMetadataPrefix    = "🄳 "
+)
+
+var knownMetadataTagIDsByContainer = map[string][]string{
+	"m4a": {
+		"title",
+		"title_sort",
+		"artist",
+		"artist_sort",
+		"album",
+		"album_sort",
+		"album_artist",
+		"album_artist_sort",
+		"composer",
+		"composer_sort",
+		"genre",
+		"track_number",
+		"track_total",
+		"disc_number",
+		"disc_total",
+		"release_date",
+		"release_type",
+		"isrc",
+		"upc",
+		"label",
+		"publisher",
+		"copyright",
+		"advisory",
+		"itunes_album_id",
+		"itunes_artist_id",
+		"album_version",
+		"lyrics",
+		"cover",
+		"performer",
+	},
+	"flac": {
+		"title",
+		"title_sort",
+		"artist",
+		"artist_sort",
+		"album",
+		"album_sort",
+		"album_artist",
+		"album_artist_sort",
+		"composer",
+		"composer_sort",
+		"genre",
+		"track_number",
+		"track_total",
+		"disc_number",
+		"disc_total",
+		"release_date",
+		"original_date",
+		"release_type",
+		"isrc",
+		"upc",
+		"label",
+		"publisher",
+		"copyright",
+		"advisory",
+		"album_version",
+		"lyrics",
+		"cover",
+		"performer",
+		"loudness",
+	},
+}
+
 var (
-	forbiddenNames = regexp.MustCompile(`[/\\<>:"|?*]`)
-	prefetchKeyURI = "skd://itunes.apple.com/P000000000/s1/e1"
-	dl_atmos       bool
-	dl_aac         bool
-	dl_select      bool
-	dl_song        bool
-	dl_preview     bool
-	dl_lyrics_only bool
-	dl_covers_only bool
-	artist_select  bool
-	debug_mode     bool
-	select_tracks  string
-	abortRetries   bool
-	alac_max       *int
-	atmos_max      *int
-	mv_max         *int
-	mv_audio_type  *string
-	aac_type       *string
-	Config         structs.ConfigSet
-	counter        structs.Counter
-	okDict         = make(map[string][]int)
+	forbiddenNames                 = regexp.MustCompile(`[/\\<>:"|?*]`)
+	customMetadataTagKeyRe         = regexp.MustCompile(`^[A-Z0-9_:-]{1,64}$`)
+	featuredTitleBracketSuffixRe   = regexp.MustCompile(`(?i)\s*[\(\[]\s*(?:feat(?:\.|uring)?|ft\.?)\s+([^\)\]]+?)\s*[\)\]]\s*$`)
+	featuredTitleInlineSuffixRe    = regexp.MustCompile(`(?i)\s+(?:[-–—]\s*)?(?:feat(?:\.|uring)?|ft\.?)\s+(.+?)\s*$`)
+	artistFeatSeparatorRe          = regexp.MustCompile(`(?i)\s+(?:feat(?:\.|uring)?|ft\.?)\s+`)
+	prefetchKeyURI                 = "skd://itunes.apple.com/P000000000/s1/e1"
+	dl_atmos                       bool
+	dl_aac                         bool
+	dl_select                      bool
+	dl_song                        bool
+	dl_preview                     bool
+	dl_lyrics_only                 bool
+	dl_covers_only                 bool
+	artist_select                  bool
+	debug_mode                     bool
+	select_tracks                  string
+	abortRetries                   bool
+	alac_max                       *int
+	atmos_max                      *int
+	mv_max                         *int
+	mv_audio_type                  *string
+	aac_type                       *string
+	Config                         structs.ConfigSet
+	counter                        structs.Counter
+	okDict                         = make(map[string][]int)
+	alacAtOnce                     sync.Once
+	alacAtAvailable                bool
+	alacAtWarnOnce                 sync.Once
+	ffprobeWarnOnce                sync.Once
+	metaflacOnce                   sync.Once
+	metaflacPath                   string
+	metaflacWarnOnce               sync.Once
+	knownMetadataTagSetByContainer = map[string]map[string]bool{
+		"m4a":  buildKnownMetadataTagSet(knownMetadataTagIDsByContainer["m4a"]),
+		"flac": buildKnownMetadataTagSet(knownMetadataTagIDsByContainer["flac"]),
+	}
+	customMetadataContainers = map[string]bool{
+		"m4a":  true,
+		"flac": true,
+	}
+	customMetadataSourceFormats = map[string]bool{
+		"lossless": true,
+		"hires":    true,
+		"aac":      true,
+		"atmos":    true,
+	}
+	metadataTagsEnabledM4a  = map[string]bool{}
+	metadataTagsEnabledFlac = map[string]bool{}
+	metadataCustomTagsM4a   = map[string]string{}
+	metadataCustomTagsFlac  = map[string]string{}
 )
 
 func loadConfig() error {
@@ -73,7 +178,244 @@ func loadConfig() error {
 	if len(Config.Storefront) != 2 {
 		Config.Storefront = "us"
 	}
+	if strings.TrimSpace(Config.AlacRepairMode) == "" {
+		Config.AlacRepairMode = "all"
+	}
 	return nil
+}
+
+func normalizeMetadataContainer(container string) string {
+	normalized := strings.ToLower(strings.TrimSpace(container))
+	if normalized == "flac" {
+		return "flac"
+	}
+	return "m4a"
+}
+
+func metadataTagOrderForContainer(container string) []string {
+	return knownMetadataTagIDsByContainer[normalizeMetadataContainer(container)]
+}
+
+func metadataTagSetForContainer(container string) map[string]bool {
+	return knownMetadataTagSetByContainer[normalizeMetadataContainer(container)]
+}
+
+func buildKnownMetadataTagSet(tagIDs []string) map[string]bool {
+	set := make(map[string]bool, len(tagIDs))
+	for _, tag := range tagIDs {
+		set[tag] = true
+	}
+	return set
+}
+
+func defaultMetadataTagList(container string) []string {
+	order := metadataTagOrderForContainer(container)
+	out := make([]string, len(order))
+	copy(out, order)
+	return out
+}
+
+func normalizeKnownMetadataTagsForContainer(entries []string, container string) []string {
+	tagSet := metadataTagSetForContainer(container)
+	order := metadataTagOrderForContainer(container)
+	seen := make(map[string]struct{}, len(entries))
+	ordered := make([]string, 0, len(entries))
+	for _, raw := range entries {
+		tag := strings.ToLower(strings.TrimSpace(raw))
+		if tag == "" {
+			continue
+		}
+		if !tagSet[tag] {
+			fmt.Printf("Skipping unknown metadata tag: %s\n", tag)
+			continue
+		}
+		if _, ok := seen[tag]; ok {
+			continue
+		}
+		seen[tag] = struct{}{}
+		ordered = append(ordered, tag)
+	}
+	sort.SliceStable(ordered, func(i, j int) bool {
+		idxI := len(order)
+		idxJ := len(order)
+		for idx, tag := range order {
+			if tag == ordered[i] {
+				idxI = idx
+			}
+			if tag == ordered[j] {
+				idxJ = idx
+			}
+		}
+		return idxI < idxJ
+	})
+	return ordered
+}
+
+func metadataTagsForContainer(container string) ([]string, bool) {
+	switch strings.ToLower(strings.TrimSpace(container)) {
+	case "flac":
+		return Config.MetadataTagsFlac, Config.MetadataTagsFlac != nil
+	default:
+		return Config.MetadataTagsM4a, Config.MetadataTagsM4a != nil
+	}
+}
+
+func envKeyForContainer(container string) string {
+	switch strings.ToLower(strings.TrimSpace(container)) {
+	case "flac":
+		return envMetadataTagsFlac
+	default:
+		return envMetadataTagsM4a
+	}
+}
+
+func resolveMetadataTagsEnabledForContainer(container string) map[string]bool {
+	var active []string
+	envKey := envKeyForContainer(container)
+	if envTags, hasEnv := os.LookupEnv(envKey); hasEnv {
+		if strings.TrimSpace(envTags) == "" {
+			active = []string{}
+		} else {
+			active = strings.Split(envTags, ",")
+		}
+	} else {
+		configTags, hasConfig := metadataTagsForContainer(container)
+		if hasConfig {
+			active = configTags
+		} else {
+			active = defaultMetadataTagList(container)
+		}
+	}
+
+	normalized := normalizeKnownMetadataTagsForContainer(active, container)
+	enabled := make(map[string]bool, len(normalized))
+	for _, tag := range normalized {
+		enabled[tag] = true
+	}
+	return enabled
+}
+
+func metadataTagEnabled(tag string) bool {
+	return metadataTagsEnabledM4a[strings.ToLower(strings.TrimSpace(tag))]
+}
+
+func metadataTagEnabledFlac(tag string) bool {
+	return metadataTagsEnabledFlac[strings.ToLower(strings.TrimSpace(tag))]
+}
+
+func normalizeCustomMetadataTargets(entries []string, allowSet map[string]bool) map[string]bool {
+	normalized := make(map[string]bool, len(entries))
+	for _, raw := range entries {
+		value := strings.ToLower(strings.TrimSpace(raw))
+		if value == "" {
+			continue
+		}
+		if !allowSet[value] {
+			continue
+		}
+		normalized[value] = true
+	}
+	return normalized
+}
+
+func assignCustomMetadataWithLimit(target map[string]string, key, value, container string, capped *bool) {
+	if _, exists := target[key]; exists {
+		target[key] = value
+		return
+	}
+	if len(target) >= maxCustomMetadataTags {
+		if !*capped {
+			fmt.Printf("Reached custom %s tag limit (%d); remaining entries are ignored.\n", container, maxCustomMetadataTags)
+			*capped = true
+		}
+		return
+	}
+	target[key] = value
+}
+
+func resolveActiveMetadataSourceFormat() string {
+	if rawSource, hasEnv := os.LookupEnv(envSourceFormat); hasEnv {
+		source := strings.ToLower(strings.TrimSpace(rawSource))
+		if customMetadataSourceFormats[source] {
+			return source
+		}
+		fmt.Printf("Ignoring unsupported metadata source format override (%s=%s).\n", envSourceFormat, rawSource)
+	}
+	if dl_atmos {
+		return "atmos"
+	}
+	if dl_aac {
+		return "aac"
+	}
+	return "lossless"
+}
+
+func parseCustomMetadataTagRules(
+	rules []structs.MetadataCustomTagRule,
+	activeSourceFormat string,
+) (map[string]string, map[string]string) {
+	customM4a := map[string]string{}
+	customFlac := map[string]string{}
+	if len(rules) == 0 {
+		return customM4a, customFlac
+	}
+
+	cappedM4a := false
+	cappedFlac := false
+	for idx, rule := range rules {
+		ruleNumber := idx + 1
+		key := strings.ToUpper(strings.TrimSpace(rule.Key))
+		value := strings.TrimSpace(rule.Value)
+		if !customMetadataTagKeyRe.MatchString(key) {
+			fmt.Printf("Skipping custom metadata rule #%d: invalid key %q.\n", ruleNumber, rule.Key)
+			continue
+		}
+		if value == "" {
+			fmt.Printf("Skipping custom metadata rule #%d (%s): empty value.\n", ruleNumber, key)
+			continue
+		}
+		if len(value) > maxCustomMetadataValue {
+			fmt.Printf(
+				"Skipping custom metadata rule #%d (%s): value too long (>%d).\n",
+				ruleNumber,
+				key,
+				maxCustomMetadataValue,
+			)
+			continue
+		}
+
+		containers := normalizeCustomMetadataTargets(rule.Containers, customMetadataContainers)
+		if len(containers) == 0 {
+			fmt.Printf("Skipping custom metadata rule #%d (%s): no valid containers.\n", ruleNumber, key)
+			continue
+		}
+		sourceFormats := normalizeCustomMetadataTargets(rule.SourceFormats, customMetadataSourceFormats)
+		if len(sourceFormats) == 0 {
+			fmt.Printf("Skipping custom metadata rule #%d (%s): no valid source formats.\n", ruleNumber, key)
+			continue
+		}
+		if !sourceFormats[activeSourceFormat] {
+			continue
+		}
+
+		if containers["m4a"] {
+			assignCustomMetadataWithLimit(customM4a, key, value, "m4a", &cappedM4a)
+		}
+		if containers["flac"] {
+			assignCustomMetadataWithLimit(customFlac, key, value, "flac", &cappedFlac)
+		}
+	}
+	return customM4a, customFlac
+}
+
+func initMetadataPolicy() {
+	metadataTagsEnabledM4a = resolveMetadataTagsEnabledForContainer("m4a")
+	metadataTagsEnabledFlac = resolveMetadataTagsEnabledForContainer("flac")
+	activeSourceFormat := resolveActiveMetadataSourceFormat()
+	metadataCustomTagsM4a, metadataCustomTagsFlac = parseCustomMetadataTagRules(
+		Config.MetadataCustomTagRules,
+		activeSourceFormat,
+	)
 }
 
 func LimitString(s string) string {
@@ -532,11 +874,7 @@ func detectReleaseType(name string, trackCount int, isSingle bool) string {
 	if isSingle || strings.Contains(lower, "single") {
 		return "Singles"
 	}
-	if strings.Contains(lower, " ep") ||
-		strings.HasSuffix(lower, " ep") ||
-		strings.Contains(lower, "- ep") ||
-		strings.Contains(lower, "(ep)") ||
-		strings.Contains(lower, "[ep]") {
+	if looksLikeEPName(lower) {
 		return "EPs"
 	}
 	if trackCount > 0 {
@@ -548,6 +886,42 @@ func detectReleaseType(name string, trackCount int, isSingle bool) string {
 		}
 	}
 	return "Albums"
+}
+
+func looksLikeEPName(lowerName string) bool {
+	return strings.Contains(lowerName, " ep") ||
+		strings.HasSuffix(lowerName, " ep") ||
+		strings.Contains(lowerName, "- ep") ||
+		strings.Contains(lowerName, "(ep)") ||
+		strings.Contains(lowerName, "[ep]")
+}
+
+func detectMetadataReleaseType(name string, trackCount int, isSingle, isCompilation bool) string {
+	lower := strings.ToLower(name)
+	if isCompilation {
+		return "compilation"
+	}
+	if isSingle {
+		return "single"
+	}
+	if strings.Contains(lower, "mixtape") {
+		return "mixtape"
+	}
+	if strings.Contains(lower, "single") {
+		return "single"
+	}
+	if looksLikeEPName(lower) {
+		return "ep"
+	}
+	if trackCount > 0 {
+		if trackCount <= 3 {
+			return "single"
+		}
+		if trackCount <= 6 {
+			return "ep"
+		}
+	}
+	return "album"
 }
 
 func releaseFolderLabel(releaseType string) string {
@@ -944,6 +1318,30 @@ func releaseTypeForTrack(track *task.Track) string {
 	return "Albums"
 }
 
+func metadataReleaseTypeForTrack(track *task.Track) string {
+	if track == nil {
+		return ""
+	}
+	if track.AlbumData.ID != "" {
+		return detectMetadataReleaseType(
+			track.AlbumData.Attributes.Name,
+			track.AlbumData.Attributes.TrackCount,
+			track.AlbumData.Attributes.IsSingle,
+			track.AlbumData.Attributes.IsCompilation,
+		)
+	}
+	if len(track.Resp.Relationships.Albums.Data) > 0 {
+		album := track.Resp.Relationships.Albums.Data[0].Attributes
+		return detectMetadataReleaseType(
+			album.Name,
+			album.TrackCount,
+			album.IsSingle,
+			album.IsCompilation,
+		)
+	}
+	return detectMetadataReleaseType(track.Resp.Attributes.AlbumName, 0, false, false)
+}
+
 func emitHistoryEntry(track *task.Track) {
 	if !shouldEmitHistory() {
 		return
@@ -964,6 +1362,64 @@ func emitHistoryEntry(track *task.Track) {
 	payload, err := json.Marshal(entry)
 	if err != nil {
 		fmt.Println("Failed to emit history:", err)
+		return
+	}
+	fmt.Printf("HISTORY:%s\n", string(payload))
+}
+
+func emitUnavailableEntry(track *task.Track, reason string) {
+	if !shouldEmitHistory() {
+		return
+	}
+	requestedFormat := resolveActiveMetadataSourceFormat()
+	entry := map[string]any{
+		"_history_entry":   "unavailable",
+		"reason":           strings.TrimSpace(reason),
+		"requested_format": requestedFormat,
+		"artist":           albumArtistForTrack(track),
+		"album":            albumNameForTrack(track),
+		"release_type":     releaseTypeForTrack(track),
+		"album_id":         albumIDForTrack(track),
+		"track_num":        track.Resp.Attributes.TrackNumber,
+		"track_name":       track.Resp.Attributes.Name,
+		"storefront":       track.Storefront,
+	}
+	if track.Resp.Attributes.TrackNumber == 0 {
+		entry["track_num"] = track.TaskNum
+	}
+	payload, err := json.Marshal(entry)
+	if err != nil {
+		fmt.Println("Failed to emit unavailable entry:", err)
+		return
+	}
+	fmt.Printf("HISTORY:%s\n", string(payload))
+}
+
+func emitRepairEntry(track *task.Track, sourcePath string, repairMode string, repairReason string) {
+	if !shouldEmitHistory() {
+		return
+	}
+	requestedFormat := resolveActiveMetadataSourceFormat()
+	entry := map[string]any{
+		"_history_entry":   "repair",
+		"reason":           strings.TrimSpace(repairReason),
+		"repair_mode":      strings.TrimSpace(repairMode),
+		"requested_format": requestedFormat,
+		"artist":           albumArtistForTrack(track),
+		"album":            albumNameForTrack(track),
+		"release_type":     releaseTypeForTrack(track),
+		"album_id":         albumIDForTrack(track),
+		"track_num":        track.Resp.Attributes.TrackNumber,
+		"track_name":       track.Resp.Attributes.Name,
+		"storefront":       track.Storefront,
+		"file_path":        strings.TrimSpace(sourcePath),
+	}
+	if track.Resp.Attributes.TrackNumber == 0 {
+		entry["track_num"] = track.TaskNum
+	}
+	payload, err := json.Marshal(entry)
+	if err != nil {
+		fmt.Println("Failed to emit repair entry:", err)
 		return
 	}
 	fmt.Printf("HISTORY:%s\n", string(payload))
@@ -1377,9 +1833,546 @@ func isLossySource(ext string, codec string) bool {
 	return false
 }
 
+func normalizeAlacRepairMode(mode string) string {
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	switch mode {
+	case "all", "corrupt-only", "off":
+		return mode
+	case "":
+		return "all"
+	default:
+		return "all"
+	}
+}
+
+func resolveFFmpegPath() (string, error) {
+	path := strings.TrimSpace(Config.FFmpegPath)
+	if path == "" {
+		path = "ffmpeg"
+	}
+	return exec.LookPath(path)
+}
+
+func resolveFFprobePath(ffmpegPath string) string {
+	if ffmpegPath != "" && ffmpegPath != "ffmpeg" {
+		candidate := filepath.Join(filepath.Dir(ffmpegPath), "ffprobe")
+		if _, err := exec.LookPath(candidate); err == nil {
+			return candidate
+		}
+	}
+	if _, err := exec.LookPath("ffprobe"); err == nil {
+		return "ffprobe"
+	}
+	return ""
+}
+
+func canUseAlacAt(ffmpegPath string) bool {
+	alacAtOnce.Do(func() {
+		if runtime.GOOS != "darwin" {
+			alacAtAvailable = false
+			return
+		}
+		if ffmpegPath == "" {
+			alacAtAvailable = false
+			return
+		}
+		cmd := exec.Command(ffmpegPath, "-hide_banner", "-decoders")
+		out, err := cmd.Output()
+		if err != nil {
+			alacAtAvailable = false
+			return
+		}
+		scanner := bufio.NewScanner(bytes.NewReader(out))
+		for scanner.Scan() {
+			line := scanner.Text()
+			if strings.Contains(line, " alac_at") || strings.Contains(line, "\talac_at") {
+				alacAtAvailable = true
+				return
+			}
+		}
+		alacAtAvailable = false
+	})
+	return alacAtAvailable
+}
+
+func warnAlacAtFallback() {
+	alacAtWarnOnce.Do(func() {
+		if runtime.GOOS != "darwin" {
+			fmt.Println("ALAC decode: alac_at is macOS-only; falling back to ffmpeg's native ALAC decoder.")
+			return
+		}
+		fmt.Println("ALAC decode: ffmpeg does not list alac_at; falling back to native ALAC decoder.")
+	})
+}
+
+func warnFfprobeMissing() {
+	ffprobeWarnOnce.Do(func() {
+		fmt.Println("ffprobe unavailable; skipping FLAC metadata extraction from source tags.")
+	})
+}
+
+func resolveMetaflacPath() string {
+	metaflacOnce.Do(func() {
+		path, err := exec.LookPath("metaflac")
+		if err != nil {
+			metaflacPath = ""
+			return
+		}
+		metaflacPath = path
+	})
+	return metaflacPath
+}
+
+func warnMetaflacMissing() {
+	metaflacWarnOnce.Do(func() {
+		fmt.Println("metaflac unavailable; skipping FLAC tag normalization.")
+	})
+}
+
+func flacGetTag(metaPath, filePath, key string) string {
+	cmd := exec.Command(metaPath, "--show-tag", key, filePath)
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	scanner := bufio.NewScanner(bytes.NewReader(out))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		return strings.TrimSpace(parts[1])
+	}
+	return ""
+}
+
+func runMetaflac(metaPath string, args ...string) {
+	if metaPath == "" {
+		return
+	}
+	cmd := exec.Command(metaPath, args...)
+	_ = cmd.Run()
+}
+
+func postprocessFlacTags(filePath string) {
+	metaPath := resolveMetaflacPath()
+	if metaPath == "" {
+		warnMetaflacMissing()
+		return
+	}
+
+	trackNumber := flacGetTag(metaPath, filePath, "TRACKNUMBER")
+	if strings.Contains(trackNumber, "/") {
+		parts := strings.SplitN(trackNumber, "/", 2)
+		tnum := strings.TrimSpace(parts[0])
+		ttot := strings.TrimSpace(parts[1])
+		if tnum != "" && ttot != "" {
+			runMetaflac(
+				metaPath,
+				"--remove-tag=TRACKNUMBER",
+				"--remove-tag=TRACKTOTAL",
+				"--remove-tag=TOTALTRACKS",
+				"--set-tag=TRACKNUMBER="+tnum,
+				"--set-tag=TOTALTRACKS="+ttot,
+				"--set-tag=TRACKTOTAL="+ttot,
+				filePath,
+			)
+		}
+	}
+
+	discNumber := flacGetTag(metaPath, filePath, "DISCNUMBER")
+	if strings.Contains(discNumber, "/") {
+		parts := strings.SplitN(discNumber, "/", 2)
+		dnum := strings.TrimSpace(parts[0])
+		dtot := strings.TrimSpace(parts[1])
+		if dnum != "" && dtot != "" {
+			runMetaflac(
+				metaPath,
+				"--remove-tag=DISCNUMBER",
+				"--remove-tag=DISCTOTAL",
+				"--remove-tag=TOTALDISCS",
+				"--set-tag=DISCNUMBER="+dnum,
+				"--set-tag=TOTALDISCS="+dtot,
+				"--set-tag=DISCTOTAL="+dtot,
+				filePath,
+			)
+		}
+	}
+
+	runMetaflac(
+		metaPath,
+		"--remove-tag=major_brand",
+		"--remove-tag=MAJOR_BRAND",
+		"--remove-tag=minor_version",
+		"--remove-tag=MINOR_VERSION",
+		"--remove-tag=compatible_brands",
+		"--remove-tag=COMPATIBLE_BRANDS",
+		"--remove-tag=creation_time",
+		"--remove-tag=CREATION_TIME",
+		"--remove-tag=ENCODER",
+		"--remove-tag=encoder",
+		"--remove-tag=ENCODED_BY",
+		"--remove-tag=encoded_by",
+		filePath,
+	)
+}
+
+func readFormatTags(ffprobePath, inPath string) (map[string]string, error) {
+	cmd := exec.Command(
+		ffprobePath,
+		"-v",
+		"error",
+		"-show_entries",
+		"format_tags",
+		"-of",
+		"default=nw=1",
+		inPath,
+	)
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, err
+	}
+	tags := map[string]string{}
+	scanner := bufio.NewScanner(bytes.NewReader(out))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		line = strings.TrimPrefix(line, "TAG:")
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		key := strings.ToLower(strings.TrimSpace(parts[0]))
+		value := strings.TrimSpace(parts[1])
+		if key == "" || value == "" {
+			continue
+		}
+		tags[key] = value
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return tags, nil
+}
+
+func pickFirstTag(tags map[string]string, keys ...string) string {
+	for _, key := range keys {
+		if val := tags[key]; val != "" {
+			return val
+		}
+	}
+	return ""
+}
+
+func splitTagFraction(value string) (string, string) {
+	raw := strings.TrimSpace(value)
+	if raw == "" {
+		return "", ""
+	}
+	parts := strings.SplitN(raw, "/", 2)
+	left := strings.TrimSpace(parts[0])
+	if len(parts) == 1 {
+		return left, ""
+	}
+	right := strings.TrimSpace(parts[1])
+	return left, right
+}
+
+func assignFlacMetadata(metadata map[string]string, key, value string) {
+	val := strings.TrimSpace(value)
+	if key == "" || val == "" {
+		return
+	}
+	metadata[key] = val
+}
+
+func buildSelectedFlacMetadataFromTags(tags map[string]string) map[string]string {
+	metadata := map[string]string{}
+
+	if metadataTagEnabledFlac("title") {
+		assignFlacMetadata(metadata, "TITLE", pickFirstTag(tags, "title"))
+	}
+	if metadataTagEnabledFlac("title_sort") {
+		assignFlacMetadata(metadata, "TITLESORT", pickFirstTag(tags, "titlesort", "sort_name"))
+	}
+	if metadataTagEnabledFlac("artist") {
+		assignFlacMetadata(metadata, "ARTIST", pickFirstTag(tags, "artist"))
+	}
+	if metadataTagEnabledFlac("artist_sort") {
+		assignFlacMetadata(metadata, "ARTISTSORT", pickFirstTag(tags, "artistsort", "sort_artist"))
+	}
+	if metadataTagEnabledFlac("album") {
+		assignFlacMetadata(metadata, "ALBUM", pickFirstTag(tags, "album"))
+	}
+	if metadataTagEnabledFlac("album_sort") {
+		assignFlacMetadata(metadata, "ALBUMSORT", pickFirstTag(tags, "albumsort", "sort_album"))
+	}
+	if metadataTagEnabledFlac("album_artist") {
+		assignFlacMetadata(metadata, "ALBUMARTIST", pickFirstTag(tags, "albumartist", "album_artist"))
+	}
+	if metadataTagEnabledFlac("album_artist_sort") {
+		assignFlacMetadata(
+			metadata,
+			"ALBUMARTISTSORT",
+			pickFirstTag(tags, "albumartistsort", "sort_album_artist", "sort_albumartist"),
+		)
+	}
+	if metadataTagEnabledFlac("composer") {
+		assignFlacMetadata(metadata, "COMPOSER", formatComposerList(pickFirstTag(tags, "composer")))
+	}
+	if metadataTagEnabledFlac("composer_sort") {
+		assignFlacMetadata(metadata, "COMPOSERSORT", formatComposerList(pickFirstTag(tags, "composersort", "sort_composer")))
+	}
+	if metadataTagEnabledFlac("genre") {
+		assignFlacMetadata(metadata, "GENRE", pickFirstTag(tags, "genre"))
+	}
+
+	trackRaw := pickFirstTag(tags, "tracknumber", "track", "tracknum")
+	trackNumber, trackTotal := splitTagFraction(trackRaw)
+	if metadataTagEnabledFlac("track_number") {
+		assignFlacMetadata(metadata, "TRACKNUMBER", trackNumber)
+	}
+	if metadataTagEnabledFlac("track_total") {
+		if trackTotal == "" {
+			trackTotal = pickFirstTag(tags, "tracktotal", "totaltracks", "track_total")
+		}
+		assignFlacMetadata(metadata, "TRACKTOTAL", trackTotal)
+	}
+
+	discRaw := pickFirstTag(tags, "discnumber", "disc", "disk")
+	discNumber, discTotal := splitTagFraction(discRaw)
+	if metadataTagEnabledFlac("disc_number") {
+		assignFlacMetadata(metadata, "DISCNUMBER", discNumber)
+	}
+	if metadataTagEnabledFlac("disc_total") {
+		if discTotal == "" {
+			discTotal = pickFirstTag(tags, "disctotal", "totaldiscs", "disc_total")
+		}
+		assignFlacMetadata(metadata, "DISCTOTAL", discTotal)
+	}
+
+	if metadataTagEnabledFlac("release_date") {
+		assignFlacMetadata(metadata, "DATE", pickFirstTag(tags, "date", "release_date", "releasedate"))
+	}
+	if metadataTagEnabledFlac("original_date") {
+		assignFlacMetadata(
+			metadata,
+			"ORIGINALDATE",
+			pickFirstTag(tags, "originaldate", "original_date", "origdate", "tdor"),
+		)
+	}
+	if metadataTagEnabledFlac("release_type") {
+		assignFlacMetadata(metadata, "RELEASETYPE", pickFirstTag(tags, "releasetype", "release_type"))
+	}
+	if metadataTagEnabledFlac("isrc") {
+		assignFlacMetadata(metadata, "ISRC", pickFirstTag(tags, "isrc"))
+	}
+	if metadataTagEnabledFlac("upc") {
+		assignFlacMetadata(metadata, "UPC", pickFirstTag(tags, "upc"))
+	}
+	if metadataTagEnabledFlac("label") {
+		assignFlacMetadata(metadata, "LABEL", pickFirstTag(tags, "label"))
+	}
+	if metadataTagEnabledFlac("publisher") {
+		assignFlacMetadata(metadata, "PUBLISHER", pickFirstTag(tags, "publisher", "label"))
+	}
+	if metadataTagEnabledFlac("copyright") {
+		assignFlacMetadata(metadata, "COPYRIGHT", pickFirstTag(tags, "copyright"))
+	}
+	if metadataTagEnabledFlac("performer") {
+		assignFlacMetadata(metadata, "PERFORMER", pickFirstTag(tags, "performer"))
+	}
+	if metadataTagEnabledFlac("lyrics") {
+		assignFlacMetadata(metadata, "LYRICS", pickFirstTag(tags, "lyrics"))
+	}
+	if metadataTagEnabledFlac("album_version") {
+		assignFlacMetadata(metadata, "ALBUMVERSION", pickFirstTag(tags, "albumversion", "edition", "version"))
+	}
+	if metadataTagEnabledFlac("loudness") {
+		assignFlacMetadata(metadata, "REPLAYGAIN_TRACK_GAIN", pickFirstTag(tags, "replaygain_track_gain"))
+		assignFlacMetadata(metadata, "REPLAYGAIN_TRACK_PEAK", pickFirstTag(tags, "replaygain_track_peak"))
+		assignFlacMetadata(metadata, "REPLAYGAIN_ALBUM_GAIN", pickFirstTag(tags, "replaygain_album_gain"))
+		assignFlacMetadata(metadata, "REPLAYGAIN_ALBUM_PEAK", pickFirstTag(tags, "replaygain_album_peak"))
+		assignFlacMetadata(metadata, "R128_TRACK_GAIN", pickFirstTag(tags, "r128_track_gain"))
+		assignFlacMetadata(metadata, "R128_ALBUM_GAIN", pickFirstTag(tags, "r128_album_gain"))
+	}
+
+	for key, value := range metadataCustomTagsFlac {
+		assignFlacMetadata(metadata, key, value)
+	}
+
+	return metadata
+}
+
+func applyAtmosPrefixToSelectedFlacMetadata(metadata map[string]string, track *task.Track) {
+	if !shouldUseAtmosMetadataPrefix(track) {
+		return
+	}
+	if value, ok := metadata["TITLE"]; ok {
+		assignFlacMetadata(metadata, "TITLE", withAtmosMetadataPrefix(value, true))
+	}
+	if value, ok := metadata["TITLESORT"]; ok {
+		assignFlacMetadata(metadata, "TITLESORT", withAtmosMetadataPrefix(value, true))
+	}
+	if value, ok := metadata["ALBUM"]; ok {
+		assignFlacMetadata(metadata, "ALBUM", withAtmosMetadataPrefix(value, true))
+	}
+	if value, ok := metadata["ALBUMSORT"]; ok {
+		assignFlacMetadata(metadata, "ALBUMSORT", withAtmosMetadataPrefix(value, true))
+	}
+}
+
+func buildSelectedFlacMetadata(ffprobePath, inPath string, track *task.Track) map[string]string {
+	tags := map[string]string{}
+
+	if ffprobePath == "" {
+		warnFfprobeMissing()
+	} else {
+		found, err := readFormatTags(ffprobePath, inPath)
+		if err != nil {
+			warnFfprobeMissing()
+		} else {
+			tags = found
+		}
+	}
+
+	metadata := buildSelectedFlacMetadataFromTags(tags)
+	if metadataTagEnabledFlac("release_type") {
+		if _, exists := metadata["RELEASETYPE"]; !exists {
+			assignFlacMetadata(metadata, "RELEASETYPE", metadataReleaseTypeForTrack(track))
+		}
+	}
+	applyAtmosPrefixToSelectedFlacMetadata(metadata, track)
+	return metadata
+}
+
+func selectAlacDecoder(ffmpegPath string) string {
+	if canUseAlacAt(ffmpegPath) {
+		return "alac_at"
+	}
+	warnAlacAtFallback()
+	return "alac"
+}
+
+func validateAlacFile(ffmpegPath, inPath string) (bool, string) {
+	cmd := exec.Command(
+		ffmpegPath,
+		"-v",
+		"error",
+		"-xerror",
+		"-err_detect",
+		"explode",
+		"-i",
+		inPath,
+		"-f",
+		"null",
+		"-",
+	)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		return true, ""
+	}
+	msg := strings.TrimSpace(string(out))
+	if msg == "" {
+		return false, err.Error()
+	}
+	lines := strings.Split(msg, "\n")
+	return false, strings.TrimSpace(lines[0])
+}
+
+func replaceFile(tmpPath, destPath string) error {
+	if err := os.Rename(tmpPath, destPath); err == nil {
+		return nil
+	}
+	if err := os.Remove(destPath); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, destPath)
+}
+
+func repairAlacInPlace(ffmpegPath, decoder, inPath string) error {
+	dir := filepath.Dir(inPath)
+	ext := filepath.Ext(inPath)
+	if ext == "" {
+		ext = ".m4a"
+	}
+	tmpFile, err := os.CreateTemp(dir, ".alac-repair-*"+ext)
+	if err != nil {
+		return err
+	}
+	tmpPath := tmpFile.Name()
+	_ = tmpFile.Close()
+
+	args := []string{"-y"}
+	if decoder != "" {
+		args = append(args, "-c:a", decoder)
+	}
+	args = append(args,
+		"-i", inPath,
+		"-map", "0",
+		"-c", "copy",
+		"-c:a", "alac",
+		"-map_metadata", "0",
+		"-map_chapters", "0",
+		tmpPath,
+	)
+	cmd := exec.Command(ffmpegPath, args...)
+	if err := cmd.Run(); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := replaceFile(tmpPath, inPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	return nil
+}
+
+func repairAlacIfNeeded(ffmpegPath, srcPath, mode, label string) (bool, string) {
+	mode = normalizeAlacRepairMode(mode)
+	if mode == "off" {
+		return false, ""
+	}
+	if label == "" {
+		label = "ALAC"
+	}
+	reason := "forced"
+	if mode == "corrupt-only" {
+		ok, msg := validateAlacFile(ffmpegPath, srcPath)
+		if ok {
+			return false, ""
+		}
+		reason = "corrupt_detected"
+		if msg != "" {
+			fmt.Printf("%s validation failed; repairing (%s)\n", label, msg)
+		} else {
+			fmt.Printf("%s validation failed; repairing.\n", label)
+		}
+	} else {
+		fmt.Printf("Repairing %s...\n", label)
+	}
+	decoder := selectAlacDecoder(ffmpegPath)
+	if err := repairAlacInPlace(ffmpegPath, decoder, srcPath); err != nil {
+		fmt.Printf("%s repair failed: %v\n", label, err)
+		return false, ""
+	}
+	fmt.Printf("%s repair complete.\n", label)
+	return true, reason
+}
+
 // CONVERSION FEATURE: Build ffmpeg arguments for desired target.
-func buildFFmpegArgs(ffmpegPath, inPath, outPath, targetFmt, extraArgs string) ([]string, error) {
-	args := []string{"-y", "-i", inPath, "-vn"}
+func buildFFmpegArgs(inPath, outPath, targetFmt, extraArgs string, decoder string) ([]string, error) {
+	args := []string{"-y"}
+	if decoder != "" {
+		args = append(args, "-c:a", decoder)
+	}
+	args = append(args, "-i", inPath, "-vn")
 	switch targetFmt {
 	case "flac":
 		args = append(args, "-c:a", "flac")
@@ -1405,11 +2398,66 @@ func buildFFmpegArgs(ffmpegPath, inPath, outPath, targetFmt, extraArgs string) (
 	return args, nil
 }
 
+func buildAlacToFlacArgs(inPath, outPath, decoder, extraArgs string, metadata map[string]string) []string {
+	args := []string{"-y"}
+	if decoder != "" {
+		args = append(args, "-c:a", decoder)
+	}
+	args = append(args,
+		"-i", inPath,
+		"-map", "0:a:0",
+		"-vn", "-sn", "-dn",
+		"-c:a", "flac",
+		"-compression_level", "8",
+		"-map_chapters", "0",
+	)
+	if len(metadata) > 0 {
+		keys := make([]string, 0, len(metadata))
+		for key := range metadata {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			if val := strings.TrimSpace(metadata[key]); val != "" {
+				args = append(args, "-metadata", fmt.Sprintf("%s=%s", key, val))
+			}
+		}
+	}
+	if extraArgs != "" {
+		args = append(args, strings.Fields(extraArgs)...)
+	}
+	args = append(args, outPath)
+	return args
+}
+
 // CONVERSION FEATURE: Perform conversion if enabled.
-func convertIfNeeded(track *task.Track) {
-	if !Config.ConvertAfterDownload {
+func convertIfNeeded(track *task.Track, lrc string) {
+	srcPath := track.SavePath
+	if srcPath == "" {
 		return
 	}
+	ext := strings.ToLower(filepath.Ext(srcPath))
+	isAlac := strings.EqualFold(track.Codec, "ALAC")
+
+	if !Config.ConvertAfterDownload {
+		if !isAlac {
+			return
+		}
+		ffmpegPath, err := resolveFFmpegPath()
+		if err != nil {
+			fmt.Printf("ffmpeg not found at '%s'; skipping ALAC repair.\n", Config.FFmpegPath)
+			return
+		}
+		repaired, repairReason := repairAlacIfNeeded(ffmpegPath, srcPath, Config.AlacRepairMode, "ALAC")
+		if repaired {
+			emitRepairEntry(track, srcPath, Config.AlacRepairMode, repairReason)
+			if err := writeMP4Tags(track, lrc); err != nil {
+				fmt.Println("⚠ Failed to restore MP4 tags after ALAC repair:", err)
+			}
+		}
+		return
+	}
+
 	if Config.ConvertFormat == "" {
 		return
 	}
@@ -1417,11 +2465,6 @@ func convertIfNeeded(track *task.Track) {
 		fmt.Printf("Conversion skipped (format %s not selected)\n", formatKeyForTrack(track))
 		return
 	}
-	srcPath := track.SavePath
-	if srcPath == "" {
-		return
-	}
-	ext := strings.ToLower(filepath.Ext(srcPath))
 	targetFmt := strings.ToLower(Config.ConvertFormat)
 
 	// Map extension for output
@@ -1451,19 +2494,59 @@ func convertIfNeeded(track *task.Track) {
 		}
 	}
 
-	if _, err := exec.LookPath(Config.FFmpegPath); err != nil {
+	ffmpegPath, err := resolveFFmpegPath()
+	if err != nil {
 		fmt.Printf("ffmpeg not found at '%s'; skipping conversion.\n", Config.FFmpegPath)
 		return
 	}
 
-	args, err := buildFFmpegArgs(Config.FFmpegPath, srcPath, outPath, targetFmt, Config.ConvertExtraArgs)
+	if targetFmt == "flac" && isAlac {
+		ffprobePath := resolveFFprobePath(ffmpegPath)
+		flacMetadata := buildSelectedFlacMetadata(ffprobePath, srcPath, track)
+		args := buildAlacToFlacArgs(srcPath, outPath, "", Config.ConvertExtraArgs, flacMetadata)
+		fmt.Printf("Converting -> %s ...\n", targetFmt)
+		cmd := exec.Command(ffmpegPath, args...)
+		cmd.Stdout = nil
+		cmd.Stderr = nil
+		start := time.Now()
+		if err := cmd.Run(); err != nil {
+			fmt.Println("Conversion failed:", err)
+			return
+		}
+		fmt.Printf("Conversion completed in %s: %s\n", time.Since(start).Truncate(time.Millisecond), filepath.Base(outPath))
+		postprocessFlacTags(outPath)
+		if Config.ConvertKeepOriginal {
+			repaired, repairReason := repairAlacIfNeeded(ffmpegPath, srcPath, Config.AlacRepairMode, "original ALAC")
+			if repaired {
+				emitRepairEntry(track, srcPath, Config.AlacRepairMode, repairReason)
+				if err := writeMP4Tags(track, lrc); err != nil {
+					fmt.Println("⚠ Failed to restore MP4 tags after original ALAC repair:", err)
+				}
+			}
+		}
+		if !Config.ConvertKeepOriginal {
+			if err := os.Remove(srcPath); err != nil {
+				fmt.Println("Failed to remove original after conversion:", err)
+			} else {
+				track.SavePath = outPath
+				track.SaveName = filepath.Base(outPath)
+				fmt.Println("Original removed.")
+			}
+		} else {
+			track.SavePath = outPath
+			track.SaveName = filepath.Base(outPath)
+		}
+		return
+	}
+
+	args, err := buildFFmpegArgs(srcPath, outPath, targetFmt, Config.ConvertExtraArgs, "")
 	if err != nil {
 		fmt.Println("Conversion config error:", err)
 		return
 	}
 
 	fmt.Printf("Converting -> %s ...\n", targetFmt)
-	cmd := exec.Command(Config.FFmpegPath, args...)
+	cmd := exec.Command(ffmpegPath, args...)
 	cmd.Stdout = nil
 	cmd.Stderr = nil
 	start := time.Now()
@@ -1473,6 +2556,15 @@ func convertIfNeeded(track *task.Track) {
 		return
 	}
 	fmt.Printf("Conversion completed in %s: %s\n", time.Since(start).Truncate(time.Millisecond), filepath.Base(outPath))
+	if Config.ConvertKeepOriginal && isAlac {
+		repaired, repairReason := repairAlacIfNeeded(ffmpegPath, srcPath, Config.AlacRepairMode, "original ALAC")
+		if repaired {
+			emitRepairEntry(track, srcPath, Config.AlacRepairMode, repairReason)
+			if err := writeMP4Tags(track, lrc); err != nil {
+				fmt.Println("⚠ Failed to restore MP4 tags after original ALAC repair:", err)
+			}
+		}
+	}
 
 	if !Config.ConvertKeepOriginal {
 		if err := os.Remove(srcPath); err != nil {
@@ -1490,6 +2582,10 @@ func convertIfNeeded(track *task.Track) {
 }
 
 func buildSongName(track *task.Track, quality string) string {
+	title, _ := metadataTitleAndArtistsFromTrack(track)
+	if title == "" {
+		title = track.Resp.Attributes.Name
+	}
 	stringsToJoin := []string{}
 	if track.Resp.Attributes.IsAppleDigitalMaster {
 		if Config.AppleMasterChoice != "" {
@@ -1514,13 +2610,44 @@ func buildSongName(track *task.Track, quality string) string {
 	return strings.NewReplacer(
 		"{SongId}", track.ID,
 		"{SongNumer}", fmt.Sprintf("%02d", trackNumber),
-		"{SongName}", LimitString(track.Resp.Attributes.Name),
+		"{SongName}", LimitString(title),
 		"{DiscNumber}", fmt.Sprintf("%0d", track.Resp.Attributes.DiscNumber),
 		"{TrackNumber}", fmt.Sprintf("%0d", trackNumber),
 		"{Quality}", quality,
 		"{Tag}", tagString,
 		"{Codec}", track.Codec,
 	).Replace(Config.SongFileFormat)
+}
+
+func withAtmosMetadataPrefix(value string, apply bool) string {
+	clean := strings.TrimSpace(value)
+	if clean == "" {
+		return ""
+	}
+	if !apply {
+		return clean
+	}
+	if strings.HasPrefix(clean, atmosMetadataPrefix) {
+		return clean
+	}
+	return atmosMetadataPrefix + clean
+}
+
+func metadataAtmosPrefixEnabled() bool {
+	if Config.MetadataAtmosPrefix == nil {
+		return true
+	}
+	return *Config.MetadataAtmosPrefix
+}
+
+func shouldUseAtmosMetadataPrefix(track *task.Track) bool {
+	if !metadataAtmosPrefixEnabled() {
+		return false
+	}
+	if resolveActiveMetadataSourceFormat() == "atmos" {
+		return true
+	}
+	return track != nil && strings.EqualFold(track.Codec, "ATMOS")
 }
 
 func normalizedArtistNames(names []string) []string {
@@ -1540,12 +2667,207 @@ func normalizedArtistNames(names []string) []string {
 	return out
 }
 
+func splitArtistTokens(raw string, delimiters []string) []string {
+	parts := []string{raw}
+	for _, delimiter := range delimiters {
+		next := make([]string, 0, len(parts))
+		for _, part := range parts {
+			if strings.Contains(part, delimiter) {
+				next = append(next, strings.Split(part, delimiter)...)
+			} else {
+				next = append(next, part)
+			}
+		}
+		parts = next
+	}
+	return parts
+}
+
+func normalizeArtistsFromField(value string) []string {
+	raw := strings.TrimSpace(value)
+	if raw == "" {
+		return nil
+	}
+	raw = artistFeatSeparatorRe.ReplaceAllString(raw, "; ")
+	parts := splitArtistTokens(raw, []string{
+		"; ",
+		";",
+		" / ",
+		" x ",
+		" X ",
+		" × ",
+	})
+	return normalizedArtistNames(parts)
+}
+
+func parseFeaturedArtists(value string) []string {
+	raw := strings.TrimSpace(value)
+	if raw == "" {
+		return nil
+	}
+	parts := splitArtistTokens(raw, []string{
+		"; ",
+		";",
+		" / ",
+		" x ",
+		" X ",
+		" × ",
+		" and ",
+		" And ",
+		" with ",
+		" With ",
+		", ",
+		",",
+	})
+	return normalizedArtistNames(parts)
+}
+
+func stripFeaturedArtistsFromTitle(title string) (string, []string) {
+	cleaned := strings.TrimSpace(title)
+	if cleaned == "" {
+		return "", nil
+	}
+	featured := []string{}
+
+	for {
+		if matches := featuredTitleBracketSuffixRe.FindStringSubmatch(cleaned); len(matches) == 2 {
+			featured = append(featured, parseFeaturedArtists(matches[1])...)
+			cleaned = strings.TrimSpace(strings.TrimSuffix(cleaned, matches[0]))
+			continue
+		}
+		if matches := featuredTitleInlineSuffixRe.FindStringSubmatch(cleaned); len(matches) == 2 {
+			featured = append(featured, parseFeaturedArtists(matches[1])...)
+			cleaned = strings.TrimSpace(strings.TrimSuffix(cleaned, matches[0]))
+			cleaned = strings.TrimSpace(strings.TrimRight(cleaned, "-–—"))
+			continue
+		}
+		break
+	}
+
+	cleaned = strings.TrimSpace(cleaned)
+	if cleaned == "" {
+		cleaned = strings.TrimSpace(title)
+	}
+	return cleaned, normalizedArtistNames(featured)
+}
+
+func metadataTitleAndArtistsFromTrack(track *task.Track) (string, []string) {
+	if track == nil {
+		return "", nil
+	}
+	cleanTitle, featuredArtists := stripFeaturedArtistsFromTitle(track.Resp.Attributes.Name)
+	artistNames := artistNamesFromTrack(track)
+	if len(featuredArtists) > 0 {
+		artistNames = normalizedArtistNames(append(artistNames, featuredArtists...))
+	}
+	return cleanTitle, artistNames
+}
+
 func formatArtistList(names []string) string {
 	normalized := normalizedArtistNames(names)
 	if len(normalized) == 0 {
 		return ""
 	}
 	return strings.Join(normalized, ", ")
+}
+
+func shouldSplitComposerConjunction(raw string) bool {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return false
+	}
+	if strings.Contains(trimmed, ";") || strings.Contains(trimmed, " / ") || strings.Contains(trimmed, " x ") || strings.Contains(trimmed, " X ") || strings.Contains(trimmed, " × ") {
+		return true
+	}
+	if shouldSplitStandaloneComposerAmpersand(trimmed) {
+		return true
+	}
+	return strings.Count(trimmed, ",") >= 2
+}
+
+func shouldSplitStandaloneComposerAmpersand(raw string) bool {
+	if strings.Count(raw, " & ") != 1 {
+		return false
+	}
+	if strings.Contains(raw, ",") || strings.Contains(raw, ";") || strings.Contains(raw, " / ") || strings.Contains(raw, " x ") || strings.Contains(raw, " X ") || strings.Contains(raw, " × ") {
+		return false
+	}
+	parts := strings.SplitN(raw, " & ", 2)
+	left := strings.TrimSpace(parts[0])
+	right := strings.TrimSpace(parts[1])
+	if left == "" || right == "" {
+		return false
+	}
+	leftWords := strings.Fields(left)
+	rightWords := strings.Fields(right)
+	if len(leftWords) == 0 || len(rightWords) == 0 {
+		return false
+	}
+	if len(leftWords) == 1 && len(rightWords) == 1 {
+		if !looksLikeComposerAbbreviation(leftWords[0]) && !looksLikeComposerAbbreviation(rightWords[0]) {
+			return false
+		}
+	}
+	return true
+}
+
+func looksLikeComposerAbbreviation(token string) bool {
+	trimmed := strings.TrimSpace(token)
+	if trimmed == "" {
+		return false
+	}
+	if len(trimmed) <= 3 {
+		hasLetter := false
+		for _, r := range trimmed {
+			if (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') {
+				hasLetter = true
+			}
+		}
+		if hasLetter && strings.ToUpper(trimmed) == trimmed {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeComposersFromField(value string) []string {
+	raw := strings.TrimSpace(value)
+	if raw == "" {
+		return nil
+	}
+	parts := splitArtistTokens(raw, []string{
+		"; ",
+		";",
+		" / ",
+		" x ",
+		" X ",
+		" × ",
+		", ",
+		",",
+	})
+	expanded := make([]string, 0, len(parts))
+	splitConjunction := shouldSplitComposerConjunction(raw)
+	for _, part := range parts {
+		token := strings.TrimSpace(part)
+		if token == "" {
+			continue
+		}
+		if splitConjunction {
+			for _, subPart := range splitArtistTokens(token, []string{" & ", " and ", " And "}) {
+				subToken := strings.TrimSpace(subPart)
+				if subToken != "" {
+					expanded = append(expanded, subToken)
+				}
+			}
+			continue
+		}
+		expanded = append(expanded, token)
+	}
+	return normalizedArtistNames(expanded)
+}
+
+func formatComposerList(value string) string {
+	return formatArtistList(normalizeComposersFromField(value))
 }
 
 func primaryArtist(names []string) string {
@@ -1566,7 +2888,7 @@ func artistNamesFromTrack(track *task.Track) []string {
 			return normalizedArtistNames(names)
 		}
 		if track.Resp.Attributes.ArtistName != "" {
-			return []string{track.Resp.Attributes.ArtistName}
+			return normalizeArtistsFromField(track.Resp.Attributes.ArtistName)
 		}
 	}
 	return nil
@@ -1584,7 +2906,7 @@ func artistNamesFromAlbumData(album *ampapi.AlbumRespData) []string {
 		return normalizedArtistNames(names)
 	}
 	if album.Attributes.ArtistName != "" {
-		return []string{album.Attributes.ArtistName}
+		return normalizeArtistsFromField(album.Attributes.ArtistName)
 	}
 	return nil
 }
@@ -1601,7 +2923,7 @@ func artistNamesFromMusicVideoData(video *ampapi.MusicVideoRespData) []string {
 		return normalizedArtistNames(names)
 	}
 	if video.Attributes.ArtistName != "" {
-		return []string{video.Attributes.ArtistName}
+		return normalizeArtistsFromField(video.Attributes.ArtistName)
 	}
 	return nil
 }
@@ -1618,11 +2940,11 @@ func albumArtistNamesFromTrack(track *task.Track) []string {
 	if len(track.Resp.Relationships.Albums.Data) > 0 {
 		albumRel := track.Resp.Relationships.Albums.Data[0]
 		if albumRel.Attributes.ArtistName != "" {
-			return []string{albumRel.Attributes.ArtistName}
+			return normalizeArtistsFromField(albumRel.Attributes.ArtistName)
 		}
 	}
 	if track.Resp.Attributes.ArtistName != "" {
-		return []string{track.Resp.Attributes.ArtistName}
+		return normalizeArtistsFromField(track.Resp.Attributes.ArtistName)
 	}
 	return nil
 }
@@ -1710,18 +3032,21 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) bool {
 	if dl_atmos {
 		if track.WebM3u8 == "" {
 			fmt.Println("Atmos not available for this track.")
+			emitUnavailableEntry(track, "atmos_unavailable")
 			counter.Unavailable++
 			return false
 		}
 		available, err := hasAtmosVariant(track.WebM3u8)
 		if err != nil {
 			fmt.Println("Atmos availability check failed:", err)
+			emitUnavailableEntry(track, "atmos_availability_check_failed")
 			counter.Unavailable++
 			markAbortRetries(err)
 			return false
 		}
 		if !available {
 			fmt.Println("Atmos not available for this track.")
+			emitUnavailableEntry(track, "atmos_unavailable")
 			counter.Unavailable++
 			return false
 		}
@@ -1734,11 +3059,17 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) bool {
 	if track.WebM3u8 == "" && !needDlAacLc {
 		if dl_atmos {
 			fmt.Println("Unavailable")
+			emitUnavailableEntry(track, "atmos_unavailable")
 			counter.Unavailable++
 			return false
 		}
-		fmt.Println("Unavailable, trying to dl aac-lc")
-		needDlAacLc = true
+		fmt.Println("Lossless/Hi-Res not available for this track. Skipping (AAC fallback is disabled).")
+		emitUnavailableEntry(track, "lossless_unavailable")
+		counter.Unavailable++
+		return false
+	}
+	if needDlAacLc {
+		track.Codec = "AAC"
 	}
 
 	needCheck := false
@@ -1878,7 +3209,8 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) bool {
 
 	// Lyrics after audio (reuse from siblings when possible)
 	var lrc string
-	if Config.EmbedLrc || Config.SaveLrcFile {
+	embedLyrics := Config.EmbedLrc && metadataTagEnabled("lyrics")
+	if embedLyrics || Config.SaveLrcFile {
 		existingPath, ok := findExistingSiblingFile(track.SaveDir, lrcFilename)
 		if ok {
 			content, err := os.ReadFile(existingPath)
@@ -1889,7 +3221,7 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) bool {
 						fmt.Println("Failed to copy lyrics:", err)
 					}
 				}
-				if Config.EmbedLrc {
+				if embedLyrics {
 					lrc = string(content)
 				}
 			}
@@ -1904,7 +3236,7 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) bool {
 						fmt.Printf("Failed to write lyrics")
 					}
 				}
-				if Config.EmbedLrc {
+				if embedLyrics {
 					lrc = lrcStr
 				}
 			}
@@ -1916,7 +3248,8 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) bool {
 		"tool=",
 		"artist=AppleMusic",
 	}
-	if Config.EmbedCover {
+	embedCover := Config.EmbedCover && metadataTagEnabled("cover")
+	if embedCover {
 		if track.CoverPath == "" {
 			coverPath, err := ensureCoverFile(track.SaveDir, "cover", track.Resp.Attributes.Artwork.URL)
 			if err != nil {
@@ -1946,7 +3279,7 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) bool {
 	}
 
 	// CONVERSION FEATURE hook
-	convertIfNeeded(track)
+	convertIfNeeded(track, lrc)
 
 	counter.Success++
 	okDict[track.PreID] = append(okDict[track.PreID], track.TaskNum)
@@ -2899,10 +4232,24 @@ func ripPlaylist(playlistId string, token string, storefront string, mediaUserTo
 	return nil
 }
 
-func writeMP4Tags(track *task.Track, lrc string) error {
-	trackArtistList := formatArtistList(artistNamesFromTrack(track))
+func buildMP4TagsForTrack(track *task.Track, lrc string) (*mp4tag.MP4Tags, error) {
+	title, titleArtists := metadataTitleAndArtistsFromTrack(track)
+	if title == "" {
+		title = track.Resp.Attributes.Name
+	}
+	useAtmosPrefix := shouldUseAtmosMetadataPrefix(track)
+	tagTitle := withAtmosMetadataPrefix(title, useAtmosPrefix)
+	albumName := withAtmosMetadataPrefix(track.Resp.Attributes.AlbumName, useAtmosPrefix)
+	composerList := formatComposerList(track.Resp.Attributes.ComposerName)
+	if composerList == "" {
+		composerList = strings.TrimSpace(track.Resp.Attributes.ComposerName)
+	}
+	trackArtistList := formatArtistList(titleArtists)
 	if trackArtistList == "" {
-		trackArtistList = track.Resp.Attributes.ArtistName
+		trackArtistList = formatArtistList(artistNamesFromTrack(track))
+		if trackArtistList == "" {
+			trackArtistList = track.Resp.Attributes.ArtistName
+		}
 	}
 	albumArtistName := primaryArtist(albumArtistNamesFromTrack(track))
 	if albumArtistName == "" {
@@ -2914,82 +4261,178 @@ func writeMP4Tags(track *task.Track, lrc string) error {
 	}
 
 	t := &mp4tag.MP4Tags{
-		Title:      track.Resp.Attributes.Name,
-		TitleSort:  track.Resp.Attributes.Name,
-		Artist:     trackArtistList,
-		ArtistSort: trackArtistList,
-		Custom: map[string]string{
-			"PERFORMER":   trackArtistList,
-			"RELEASETIME": track.Resp.Attributes.ReleaseDate,
-			"ISRC":        track.Resp.Attributes.Isrc,
-			"LABEL":       "",
-			"UPC":         "",
-		},
-		Composer:     track.Resp.Attributes.ComposerName,
-		ComposerSort: track.Resp.Attributes.ComposerName,
-		CustomGenre:  track.Resp.Attributes.GenreNames[0],
-		Lyrics:       lrc,
-		TrackNumber:  int16(trackNumber),
-		DiscNumber:   int16(track.Resp.Attributes.DiscNumber),
-		Album:        track.Resp.Attributes.AlbumName,
-		AlbumSort:    track.Resp.Attributes.AlbumName,
-	}
-	if strings.EqualFold(track.Codec, "ATMOS") {
-		t.Custom["ALBUMVERSION"] = "Dolby Atmos"
+		Custom: map[string]string{},
 	}
 
-	if track.PreType == "albums" {
+	if metadataTagEnabled("title") {
+		t.Title = tagTitle
+	}
+	if metadataTagEnabled("title_sort") {
+		t.TitleSort = tagTitle
+	}
+	if metadataTagEnabled("artist") {
+		t.Artist = trackArtistList
+	}
+	if metadataTagEnabled("artist_sort") {
+		t.ArtistSort = trackArtistList
+	}
+	if metadataTagEnabled("composer") {
+		t.Composer = composerList
+	}
+	if metadataTagEnabled("composer_sort") {
+		t.ComposerSort = composerList
+	}
+	if metadataTagEnabled("genre") && len(track.Resp.Attributes.GenreNames) > 0 {
+		t.CustomGenre = track.Resp.Attributes.GenreNames[0]
+	}
+	if metadataTagEnabled("lyrics") && lrc != "" {
+		t.Lyrics = lrc
+	}
+	if metadataTagEnabled("track_number") {
+		t.TrackNumber = int16(trackNumber)
+	}
+	if metadataTagEnabled("disc_number") {
+		t.DiscNumber = int16(track.Resp.Attributes.DiscNumber)
+	}
+	if metadataTagEnabled("album") {
+		t.Album = albumName
+	}
+	if metadataTagEnabled("album_sort") {
+		t.AlbumSort = albumName
+	}
+	if metadataTagEnabled("performer") && trackArtistList != "" {
+		t.Custom["PERFORMER"] = trackArtistList
+	}
+	if metadataTagEnabled("release_type") {
+		releaseType := metadataReleaseTypeForTrack(track)
+		if releaseType != "" {
+			t.Custom["RELEASETYPE"] = releaseType
+		}
+	}
+	if metadataTagEnabled("isrc") && track.Resp.Attributes.Isrc != "" {
+		t.Custom["ISRC"] = track.Resp.Attributes.Isrc
+	}
+
+	if metadataTagEnabled("itunes_album_id") && track.PreType == "albums" {
 		albumID, err := strconv.ParseUint(track.PreID, 10, 32)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		t.ItunesAlbumID = int32(albumID)
 	}
 
-	if len(track.Resp.Relationships.Artists.Data) > 0 {
+	if metadataTagEnabled("itunes_artist_id") && len(track.Resp.Relationships.Artists.Data) > 0 {
 		artistID, err := strconv.ParseUint(track.Resp.Relationships.Artists.Data[0].ID, 10, 32)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		t.ItunesArtistID = int32(artistID)
 	}
 
 	if (track.PreType == "playlists" || track.PreType == "stations") && !Config.UseSongInfoForPlaylist {
-		t.DiscNumber = 1
-		t.DiscTotal = 1
-		t.TrackNumber = int16(trackNumber)
-		t.TrackTotal = int16(track.TaskTotal)
-		t.Album = track.PlaylistData.Attributes.Name
-		t.AlbumSort = track.PlaylistData.Attributes.Name
-		t.AlbumArtist = albumArtistName
-		t.AlbumArtistSort = albumArtistName
+		if metadataTagEnabled("disc_number") {
+			t.DiscNumber = 1
+		}
+		if metadataTagEnabled("disc_total") {
+			t.DiscTotal = 1
+		}
+		if metadataTagEnabled("track_number") {
+			t.TrackNumber = int16(trackNumber)
+		}
+		if metadataTagEnabled("track_total") {
+			t.TrackTotal = int16(track.TaskTotal)
+		}
+		if metadataTagEnabled("album") {
+			t.Album = track.PlaylistData.Attributes.Name
+		}
+		if metadataTagEnabled("album_sort") {
+			t.AlbumSort = track.PlaylistData.Attributes.Name
+		}
+		if metadataTagEnabled("album_artist") {
+			t.AlbumArtist = albumArtistName
+		}
+		if metadataTagEnabled("album_artist_sort") {
+			t.AlbumArtistSort = albumArtistName
+		}
 	} else if (track.PreType == "playlists" || track.PreType == "stations") && Config.UseSongInfoForPlaylist {
-		t.DiscTotal = int16(track.DiscTotal)
-		t.TrackTotal = int16(track.AlbumData.Attributes.TrackCount)
-		t.AlbumArtist = albumArtistName
-		t.AlbumArtistSort = albumArtistName
-		t.Custom["UPC"] = track.AlbumData.Attributes.Upc
-		t.Custom["LABEL"] = track.AlbumData.Attributes.RecordLabel
-		t.Date = track.AlbumData.Attributes.ReleaseDate
-		t.Copyright = track.AlbumData.Attributes.Copyright
-		t.Publisher = track.AlbumData.Attributes.RecordLabel
+		if metadataTagEnabled("disc_total") {
+			t.DiscTotal = int16(track.DiscTotal)
+		}
+		if metadataTagEnabled("track_total") {
+			t.TrackTotal = int16(track.AlbumData.Attributes.TrackCount)
+		}
+		if metadataTagEnabled("album_artist") {
+			t.AlbumArtist = albumArtistName
+		}
+		if metadataTagEnabled("album_artist_sort") {
+			t.AlbumArtistSort = albumArtistName
+		}
+		if metadataTagEnabled("upc") && track.AlbumData.Attributes.Upc != "" {
+			t.Custom["UPC"] = track.AlbumData.Attributes.Upc
+		}
+		if metadataTagEnabled("label") && track.AlbumData.Attributes.RecordLabel != "" {
+			t.Custom["LABEL"] = track.AlbumData.Attributes.RecordLabel
+		}
+		if metadataTagEnabled("release_date") {
+			t.Date = track.AlbumData.Attributes.ReleaseDate
+		}
+		if metadataTagEnabled("copyright") {
+			t.Copyright = track.AlbumData.Attributes.Copyright
+		}
+		if metadataTagEnabled("publisher") {
+			t.Publisher = track.AlbumData.Attributes.RecordLabel
+		}
 	} else {
-		t.DiscTotal = int16(track.DiscTotal)
-		t.TrackTotal = int16(track.AlbumData.Attributes.TrackCount)
-		t.AlbumArtist = albumArtistName
-		t.AlbumArtistSort = albumArtistName
-		t.Custom["UPC"] = track.AlbumData.Attributes.Upc
-		t.Date = track.AlbumData.Attributes.ReleaseDate
-		t.Copyright = track.AlbumData.Attributes.Copyright
-		t.Publisher = track.AlbumData.Attributes.RecordLabel
+		if metadataTagEnabled("disc_total") {
+			t.DiscTotal = int16(track.DiscTotal)
+		}
+		if metadataTagEnabled("track_total") {
+			t.TrackTotal = int16(track.AlbumData.Attributes.TrackCount)
+		}
+		if metadataTagEnabled("album_artist") {
+			t.AlbumArtist = albumArtistName
+		}
+		if metadataTagEnabled("album_artist_sort") {
+			t.AlbumArtistSort = albumArtistName
+		}
+		if metadataTagEnabled("upc") && track.AlbumData.Attributes.Upc != "" {
+			t.Custom["UPC"] = track.AlbumData.Attributes.Upc
+		}
+		if metadataTagEnabled("release_date") {
+			t.Date = track.AlbumData.Attributes.ReleaseDate
+		}
+		if metadataTagEnabled("copyright") {
+			t.Copyright = track.AlbumData.Attributes.Copyright
+		}
+		if metadataTagEnabled("publisher") {
+			t.Publisher = track.AlbumData.Attributes.RecordLabel
+		}
+		if metadataTagEnabled("label") && track.AlbumData.Attributes.RecordLabel != "" {
+			t.Custom["LABEL"] = track.AlbumData.Attributes.RecordLabel
+		}
 	}
 
-	if track.Resp.Attributes.ContentRating == "explicit" {
-		t.ItunesAdvisory = mp4tag.ItunesAdvisoryExplicit
-	} else if track.Resp.Attributes.ContentRating == "clean" {
-		t.ItunesAdvisory = mp4tag.ItunesAdvisoryClean
-	} else {
-		t.ItunesAdvisory = mp4tag.ItunesAdvisoryNone
+	if metadataTagEnabled("advisory") {
+		if track.Resp.Attributes.ContentRating == "explicit" {
+			t.ItunesAdvisory = mp4tag.ItunesAdvisoryExplicit
+		} else if track.Resp.Attributes.ContentRating == "clean" {
+			t.ItunesAdvisory = mp4tag.ItunesAdvisoryClean
+		} else {
+			t.ItunesAdvisory = mp4tag.ItunesAdvisoryNone
+		}
+	}
+
+	for key, value := range metadataCustomTagsM4a {
+		t.Custom[key] = value
+	}
+
+	return t, nil
+}
+
+func writeMP4Tags(track *task.Track, lrc string) error {
+	t, err := buildMP4TagsForTrack(track, lrc)
+	if err != nil {
+		return err
 	}
 
 	mp4, err := mp4tag.Open(track.SavePath)
@@ -3051,6 +4494,7 @@ func main() {
 	Config.MVAudioType = *mv_audio_type
 	Config.MVMax = *mv_max
 	clearStopSignal()
+	initMetadataPolicy()
 
 	if dl_lyrics_only && dl_covers_only {
 		fmt.Println("Error: --lyrics-only and --covers-only cannot be used together.")
