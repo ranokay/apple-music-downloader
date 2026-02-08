@@ -953,6 +953,27 @@ func currentRootFolder() string {
 	return Config.AlacSaveFolder
 }
 
+func fallbackAacSaveDir(original string) string {
+	targetRoot := strings.TrimSpace(Config.AacSaveFolder)
+	if targetRoot == "" {
+		return original
+	}
+
+	originalClean := filepath.Clean(original)
+	sourceRoot := filepath.Clean(strings.TrimSpace(Config.AlacSaveFolder))
+	if sourceRoot != "" {
+		rel, err := filepath.Rel(sourceRoot, originalClean)
+		if err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+			if rel == "." {
+				return targetRoot
+			}
+			return filepath.Join(targetRoot, rel)
+		}
+	}
+
+	return filepath.Join(targetRoot, filepath.Base(originalClean))
+}
+
 func buildArtistFolderName(artistName, artistID string) string {
 	if Config.ArtistFolderFormat == "" {
 		return ""
@@ -1515,10 +1536,13 @@ type QualityOption struct {
 }
 
 type PreviewTrack struct {
-	Num    int    `json:"num"`
-	Name   string `json:"name"`
-	Artist string `json:"artist,omitempty"`
-	Album  string `json:"album,omitempty"`
+	Num        int    `json:"num"`
+	Name       string `json:"name"`
+	Artist     string `json:"artist,omitempty"`
+	Album      string `json:"album,omitempty"`
+	ID         string `json:"id,omitempty"`
+	ISRC       string `json:"isrc,omitempty"`
+	DurationMS int    `json:"duration_ms,omitempty"`
 }
 
 type PreviewPayload struct {
@@ -1738,10 +1762,13 @@ func buildPreviewPayload(rawUrl string, token string) (*PreviewPayload, error) {
 		preselected := []int{}
 		for i, track := range meta.Relationships.Tracks.Data {
 			tracks = append(tracks, PreviewTrack{
-				Num:    i + 1,
-				Name:   track.Attributes.Name,
-				Artist: track.Attributes.ArtistName,
-				Album:  meta.Attributes.Name,
+				Num:        i + 1,
+				Name:       track.Attributes.Name,
+				Artist:     track.Attributes.ArtistName,
+				Album:      meta.Attributes.Name,
+				ID:         track.ID,
+				ISRC:       track.Attributes.Isrc,
+				DurationMS: track.Attributes.DurationInMillis,
 			})
 			if preselectID != "" && track.ID == preselectID {
 				preselected = []int{i + 1}
@@ -1767,10 +1794,13 @@ func buildPreviewPayload(rawUrl string, token string) (*PreviewPayload, error) {
 		tracks := make([]PreviewTrack, 0, len(meta.Relationships.Tracks.Data))
 		for i, track := range meta.Relationships.Tracks.Data {
 			tracks = append(tracks, PreviewTrack{
-				Num:    i + 1,
-				Name:   track.Attributes.Name,
-				Artist: track.Attributes.ArtistName,
-				Album:  track.Attributes.AlbumName,
+				Num:        i + 1,
+				Name:       track.Attributes.Name,
+				Artist:     track.Attributes.ArtistName,
+				Album:      track.Attributes.AlbumName,
+				ID:         track.ID,
+				ISRC:       track.Attributes.Isrc,
+				DurationMS: track.Attributes.DurationInMillis,
 			})
 		}
 		artistName := meta.Attributes.ArtistName
@@ -1806,10 +1836,13 @@ func buildPreviewPayload(rawUrl string, token string) (*PreviewPayload, error) {
 			TrackCount:  1,
 			Tracks: []PreviewTrack{
 				{
-					Num:    1,
-					Name:   data.Attributes.Name,
-					Artist: data.Attributes.ArtistName,
-					Album:  data.Attributes.AlbumName,
+					Num:        1,
+					Name:       data.Attributes.Name,
+					Artist:     data.Attributes.ArtistName,
+					Album:      data.Attributes.AlbumName,
+					ID:         data.ID,
+					ISRC:       data.Attributes.Isrc,
+					DurationMS: data.Attributes.DurationInMillis,
 				},
 			},
 			Preselected: []int{1},
@@ -3053,6 +3086,7 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) bool {
 	}
 
 	needDlAacLc := false
+	usingLosslessFallback := false
 	if dl_aac && Config.AacType == "aac-lc" {
 		needDlAacLc = true
 	}
@@ -3063,13 +3097,22 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) bool {
 			counter.Unavailable++
 			return false
 		}
-		fmt.Println("Lossless/Hi-Res not available for this track. Skipping (AAC fallback is disabled).")
+		fmt.Println("Lossless/Hi-Res not available for this track. Falling back to AAC.")
 		emitUnavailableEntry(track, "lossless_unavailable")
-		counter.Unavailable++
-		return false
+		usingLosslessFallback = true
+		needDlAacLc = true
 	}
 	if needDlAacLc {
 		track.Codec = "AAC"
+	}
+	if usingLosslessFallback {
+		track.SaveDir = fallbackAacSaveDir(track.SaveDir)
+		track.CoverPath = ""
+		if err := os.MkdirAll(track.SaveDir, os.ModePerm); err != nil {
+			fmt.Println("Failed to create AAC fallback folder:", err)
+			counter.Error++
+			return false
+		}
 	}
 
 	needCheck := false
@@ -3149,6 +3192,11 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) bool {
 
 	if needDlAacLc {
 		if len(mediaUserToken) <= 50 {
+			if usingLosslessFallback {
+				fmt.Println("Lossless fallback to AAC requires a valid media-user-token. Skipping this track.")
+				counter.Unavailable++
+				return false
+			}
 			fmt.Println("Invalid media-user-token")
 			counter.Error++
 			return false
@@ -3157,6 +3205,10 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) bool {
 		if err != nil {
 			fmt.Println("Failed to dl aac-lc:", err)
 			if err.Error() == "Unavailable" {
+				counter.Unavailable++
+				return false
+			}
+			if usingLosslessFallback {
 				counter.Unavailable++
 				return false
 			}
