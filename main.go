@@ -116,6 +116,7 @@ var knownMetadataTagIDsByContainer = map[string][]string{
 var (
 	forbiddenNames                 = regexp.MustCompile(`[/\\<>:"|?*]`)
 	customMetadataTagKeyRe         = regexp.MustCompile(`^[A-Z0-9_:-]{1,64}$`)
+	sampleFmtBitDepthRe            = regexp.MustCompile(`^[su](\d+)`)
 	featuredTitleBracketSuffixRe   = regexp.MustCompile(`(?i)\s*[\(\[]\s*(?:feat(?:\.|uring)?|ft\.?)\s+([^\)\]]+?)\s*[\)\]]\s*$`)
 	featuredTitleInlineSuffixRe    = regexp.MustCompile(`(?i)\s+(?:[-–—]\s*)?(?:feat(?:\.|uring)?|ft\.?)\s+(.+?)\s*$`)
 	artistFeatSeparatorRe          = regexp.MustCompile(`(?i)\s+(?:feat(?:\.|uring)?|ft\.?)\s+`)
@@ -1416,7 +1417,7 @@ func emitUnavailableEntry(track *task.Track, reason string) {
 	fmt.Printf("HISTORY:%s\n", string(payload))
 }
 
-func emitRepairEntry(track *task.Track, sourcePath string, repairMode string, repairReason string) {
+func emitRepairEntry(track *task.Track, sourcePath string, repairMode string, repairReason string, bitDepthBefore int, bitDepthAfter int) {
 	if !shouldEmitHistory() {
 		return
 	}
@@ -1434,6 +1435,15 @@ func emitRepairEntry(track *task.Track, sourcePath string, repairMode string, re
 		"track_name":       track.Resp.Attributes.Name,
 		"storefront":       track.Storefront,
 		"file_path":        strings.TrimSpace(sourcePath),
+	}
+	if bitDepthBefore > 0 {
+		entry["bit_depth_before"] = bitDepthBefore
+	}
+	if bitDepthAfter > 0 {
+		entry["bit_depth_after"] = bitDepthAfter
+	}
+	if bitDepthBefore > 0 && bitDepthAfter > 0 {
+		entry["bit_depth_reduced"] = bitDepthAfter < bitDepthBefore
 	}
 	if track.Resp.Attributes.TrackNumber == 0 {
 		entry["track_num"] = track.TaskNum
@@ -1899,6 +1909,80 @@ func resolveFFprobePath(ffmpegPath string) string {
 	return ""
 }
 
+func sampleFormatBitDepth(sampleFmt string) int {
+	match := sampleFmtBitDepthRe.FindStringSubmatch(strings.TrimSpace(sampleFmt))
+	if len(match) != 2 {
+		return 0
+	}
+	bitDepth, err := strconv.Atoi(match[1])
+	if err != nil || bitDepth <= 0 {
+		return 0
+	}
+	return bitDepth
+}
+
+func probeAudioBitDepth(ffprobePath, inPath string) int {
+	if ffprobePath == "" || inPath == "" {
+		return 0
+	}
+	cmd := exec.Command(
+		ffprobePath,
+		"-v",
+		"error",
+		"-select_streams",
+		"a:0",
+		"-show_entries",
+		"stream=bits_per_raw_sample,bits_per_sample,sample_fmt",
+		"-of",
+		"default=nw=1",
+		inPath,
+	)
+	out, err := cmd.Output()
+	if err != nil {
+		return 0
+	}
+	values := map[string]string{}
+	scanner := bufio.NewScanner(bytes.NewReader(out))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		key := strings.ToLower(strings.TrimSpace(parts[0]))
+		value := strings.TrimSpace(parts[1])
+		if key == "" || value == "" {
+			continue
+		}
+		values[key] = value
+	}
+	if raw := strings.TrimSpace(values["bits_per_raw_sample"]); raw != "" {
+		if bitDepth, err := strconv.Atoi(raw); err == nil && bitDepth > 0 {
+			return bitDepth
+		}
+	}
+	if raw := strings.TrimSpace(values["bits_per_sample"]); raw != "" {
+		if bitDepth, err := strconv.Atoi(raw); err == nil && bitDepth > 0 {
+			return bitDepth
+		}
+	}
+	if sampleFmt := strings.TrimSpace(values["sample_fmt"]); sampleFmt != "" {
+		return sampleFormatBitDepth(sampleFmt)
+	}
+	return 0
+}
+
+func warnBitDepthReduction(label string, bitDepthBefore, bitDepthAfter int) bool {
+	if bitDepthBefore <= 0 || bitDepthAfter <= 0 || bitDepthAfter >= bitDepthBefore {
+		return false
+	}
+	fmt.Printf("⚠ %s reduced bit depth during repair: %d-bit -> %d-bit\n", label, bitDepthBefore, bitDepthAfter)
+	return true
+}
+
 func canUseAlacAt(ffmpegPath string) bool {
 	alacAtOnce.Do(func() {
 		if runtime.GOOS != "darwin" {
@@ -2319,6 +2403,22 @@ func validateAlacFile(ffmpegPath, inPath string) (bool, string) {
 	return false, strings.TrimSpace(lines[0])
 }
 
+func decideAlacRepair(ffmpegPath, srcPath, mode string) (bool, string, string) {
+	normalized := normalizeAlacRepairMode(mode)
+	switch normalized {
+	case "off":
+		return false, "", ""
+	case "all":
+		return true, "forced", ""
+	default:
+		ok, msg := validateAlacFile(ffmpegPath, srcPath)
+		if ok {
+			return false, "", ""
+		}
+		return true, "corrupt_detected", msg
+	}
+}
+
 func replaceFile(tmpPath, destPath string) error {
 	if err := os.Rename(tmpPath, destPath); err == nil {
 		return nil
@@ -2367,35 +2467,39 @@ func repairAlacInPlace(ffmpegPath, decoder, inPath string) error {
 	return nil
 }
 
-func repairAlacIfNeeded(ffmpegPath, srcPath, mode, label string) (bool, string) {
-	mode = normalizeAlacRepairMode(mode)
-	if mode == "off" {
-		return false, ""
-	}
+func runAlacRepair(ffmpegPath, decoder, srcPath, label, reason, validationMsg string) error {
 	if label == "" {
 		label = "ALAC"
 	}
-	reason := "forced"
-	if mode == "corrupt-only" {
-		ok, msg := validateAlacFile(ffmpegPath, srcPath)
-		if ok {
-			return false, ""
-		}
-		reason = "corrupt_detected"
-		if msg != "" {
-			fmt.Printf("%s validation failed; repairing (%s)\n", label, msg)
+	if reason == "corrupt_detected" {
+		if validationMsg != "" {
+			fmt.Printf("%s validation failed; repairing (%s)\n", label, validationMsg)
 		} else {
 			fmt.Printf("%s validation failed; repairing.\n", label)
 		}
 	} else {
 		fmt.Printf("Repairing %s...\n", label)
 	}
-	decoder := selectAlacDecoder(ffmpegPath)
+	if decoder == "" {
+		decoder = selectAlacDecoder(ffmpegPath)
+	}
 	if err := repairAlacInPlace(ffmpegPath, decoder, srcPath); err != nil {
 		fmt.Printf("%s repair failed: %v\n", label, err)
-		return false, ""
+		return err
 	}
 	fmt.Printf("%s repair complete.\n", label)
+	return nil
+}
+
+func repairAlacIfNeeded(ffmpegPath, srcPath, mode, label string) (bool, string) {
+	shouldRepair, reason, validationMsg := decideAlacRepair(ffmpegPath, srcPath, mode)
+	if !shouldRepair {
+		return false, ""
+	}
+	decoder := selectAlacDecoder(ffmpegPath)
+	if err := runAlacRepair(ffmpegPath, decoder, srcPath, label, reason, validationMsg); err != nil {
+		return false, ""
+	}
 	return true, reason
 }
 
@@ -2443,6 +2547,7 @@ func buildAlacToFlacArgs(inPath, outPath, decoder, extraArgs string, metadata ma
 		"-c:a", "flac",
 		"-compression_level", "8",
 		"-map_chapters", "0",
+		"-map_metadata", "0",
 	)
 	if len(metadata) > 0 {
 		keys := make([]string, 0, len(metadata))
@@ -2471,6 +2576,7 @@ func convertIfNeeded(track *task.Track, lrc string) {
 	}
 	ext := strings.ToLower(filepath.Ext(srcPath))
 	isAlac := strings.EqualFold(track.Codec, "ALAC")
+	repairMode := normalizeAlacRepairMode(Config.AlacRepairMode)
 
 	if !Config.ConvertAfterDownload {
 		if !isAlac {
@@ -2481,9 +2587,13 @@ func convertIfNeeded(track *task.Track, lrc string) {
 			fmt.Printf("ffmpeg not found at '%s'; skipping ALAC repair.\n", Config.FFmpegPath)
 			return
 		}
-		repaired, repairReason := repairAlacIfNeeded(ffmpegPath, srcPath, Config.AlacRepairMode, "ALAC")
+		ffprobePath := resolveFFprobePath(ffmpegPath)
+		sourceBitDepth := probeAudioBitDepth(ffprobePath, srcPath)
+		repaired, repairReason := repairAlacIfNeeded(ffmpegPath, srcPath, repairMode, "ALAC")
 		if repaired {
-			emitRepairEntry(track, srcPath, Config.AlacRepairMode, repairReason)
+			repairedBitDepth := probeAudioBitDepth(ffprobePath, srcPath)
+			warnBitDepthReduction("ALAC repair", sourceBitDepth, repairedBitDepth)
+			emitRepairEntry(track, srcPath, repairMode, repairReason, sourceBitDepth, repairedBitDepth)
 			if err := writeMP4Tags(track, lrc); err != nil {
 				fmt.Println("⚠ Failed to restore MP4 tags after ALAC repair:", err)
 			}
@@ -2532,11 +2642,24 @@ func convertIfNeeded(track *task.Track, lrc string) {
 		fmt.Printf("ffmpeg not found at '%s'; skipping conversion.\n", Config.FFmpegPath)
 		return
 	}
+	ffprobePath := resolveFFprobePath(ffmpegPath)
+
+	alacDecoder := ""
+	alacNeedsRepair := false
+	alacRepairReason := ""
+	alacRepairMessage := ""
+	sourceBitDepth := 0
+	if isAlac {
+		alacNeedsRepair, alacRepairReason, alacRepairMessage = decideAlacRepair(ffmpegPath, srcPath, repairMode)
+		if alacNeedsRepair {
+			sourceBitDepth = probeAudioBitDepth(ffprobePath, srcPath)
+			alacDecoder = selectAlacDecoder(ffmpegPath)
+		}
+	}
 
 	if targetFmt == "flac" && isAlac {
-		ffprobePath := resolveFFprobePath(ffmpegPath)
 		flacMetadata := buildSelectedFlacMetadata(ffprobePath, srcPath, track)
-		args := buildAlacToFlacArgs(srcPath, outPath, "", Config.ConvertExtraArgs, flacMetadata)
+		args := buildAlacToFlacArgs(srcPath, outPath, alacDecoder, Config.ConvertExtraArgs, flacMetadata)
 		fmt.Printf("Converting -> %s ...\n", targetFmt)
 		cmd := exec.Command(ffmpegPath, args...)
 		cmd.Stdout = nil
@@ -2548,16 +2671,25 @@ func convertIfNeeded(track *task.Track, lrc string) {
 		}
 		fmt.Printf("Conversion completed in %s: %s\n", time.Since(start).Truncate(time.Millisecond), filepath.Base(outPath))
 		postprocessFlacTags(outPath)
+		outputBitDepth := 0
+		if alacNeedsRepair {
+			outputBitDepth = probeAudioBitDepth(ffprobePath, outPath)
+		}
 		if Config.ConvertKeepOriginal {
-			repaired, repairReason := repairAlacIfNeeded(ffmpegPath, srcPath, Config.AlacRepairMode, "original ALAC")
-			if repaired {
-				emitRepairEntry(track, srcPath, Config.AlacRepairMode, repairReason)
+			if alacNeedsRepair && runAlacRepair(ffmpegPath, alacDecoder, srcPath, "original ALAC", alacRepairReason, alacRepairMessage) == nil {
+				repairedBitDepth := probeAudioBitDepth(ffprobePath, srcPath)
+				warnBitDepthReduction("ALAC repair", sourceBitDepth, repairedBitDepth)
+				emitRepairEntry(track, srcPath, repairMode, alacRepairReason, sourceBitDepth, repairedBitDepth)
 				if err := writeMP4Tags(track, lrc); err != nil {
 					fmt.Println("⚠ Failed to restore MP4 tags after original ALAC repair:", err)
 				}
 			}
 		}
 		if !Config.ConvertKeepOriginal {
+			if alacNeedsRepair {
+				warnBitDepthReduction("ALAC->FLAC repair path", sourceBitDepth, outputBitDepth)
+				emitRepairEntry(track, outPath, repairMode, alacRepairReason, sourceBitDepth, outputBitDepth)
+			}
 			if err := os.Remove(srcPath); err != nil {
 				fmt.Println("Failed to remove original after conversion:", err)
 			} else {
@@ -2572,7 +2704,7 @@ func convertIfNeeded(track *task.Track, lrc string) {
 		return
 	}
 
-	args, err := buildFFmpegArgs(srcPath, outPath, targetFmt, Config.ConvertExtraArgs, "")
+	args, err := buildFFmpegArgs(srcPath, outPath, targetFmt, Config.ConvertExtraArgs, alacDecoder)
 	if err != nil {
 		fmt.Println("Conversion config error:", err)
 		return
@@ -2590,9 +2722,10 @@ func convertIfNeeded(track *task.Track, lrc string) {
 	}
 	fmt.Printf("Conversion completed in %s: %s\n", time.Since(start).Truncate(time.Millisecond), filepath.Base(outPath))
 	if Config.ConvertKeepOriginal && isAlac {
-		repaired, repairReason := repairAlacIfNeeded(ffmpegPath, srcPath, Config.AlacRepairMode, "original ALAC")
-		if repaired {
-			emitRepairEntry(track, srcPath, Config.AlacRepairMode, repairReason)
+		if alacNeedsRepair && runAlacRepair(ffmpegPath, alacDecoder, srcPath, "original ALAC", alacRepairReason, alacRepairMessage) == nil {
+			repairedBitDepth := probeAudioBitDepth(ffprobePath, srcPath)
+			warnBitDepthReduction("ALAC repair", sourceBitDepth, repairedBitDepth)
+			emitRepairEntry(track, srcPath, repairMode, alacRepairReason, sourceBitDepth, repairedBitDepth)
 			if err := writeMP4Tags(track, lrc); err != nil {
 				fmt.Println("⚠ Failed to restore MP4 tags after original ALAC repair:", err)
 			}
@@ -2600,6 +2733,9 @@ func convertIfNeeded(track *task.Track, lrc string) {
 	}
 
 	if !Config.ConvertKeepOriginal {
+		if isAlac && alacNeedsRepair {
+			emitRepairEntry(track, outPath, repairMode, alacRepairReason, 0, 0)
+		}
 		if err := os.Remove(srcPath); err != nil {
 			fmt.Println("Failed to remove original after conversion:", err)
 		} else {
