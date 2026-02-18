@@ -6,5 +6,10 @@
 !go.sum
 !main.go
 !README.md
+!utils/
 !utils/*
+utils/.DS_Store
+!utils/playlistdedupe/
+!utils/playlistdedupe/*
+utils/playlistdedupe/.DS_Store
 !config.example.yaml

@@ -16,6 +16,10 @@ func GetArtistResp(storefront string, id string, language string, token string) 
 			return nil, err
 		}
 	}
+	cached := new(ArtistResp)
+	if hit, _ := loadCachedJSON("artist", cached, storefront, id, language); hit {
+		return cached, nil
+	}
 
 	req, err := http.NewRequest("GET", fmt.Sprintf("https://amp-api.music.apple.com/v1/catalog/%s/artists/%s", storefront, id), nil)
 	if err != nil {
@@ -40,6 +44,7 @@ func GetArtistResp(storefront string, id string, language string, token string) 
 	if err := json.NewDecoder(do.Body).Decode(&obj); err != nil {
 		return nil, err
 	}
+	saveCachedJSON("artist", obj, storefront, id, language)
 	return obj, nil
 }
 

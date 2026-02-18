@@ -16,6 +16,10 @@ func GetSongResp(storefront string, id string, language string, token string) (*
 			return nil, err
 		}
 	}
+	cached := new(SongResp)
+	if hit, _ := loadCachedJSON("song", cached, storefront, id, language); hit {
+		return cached, nil
+	}
 
 	req, err := http.NewRequest("GET", fmt.Sprintf("https://amp-api.music.apple.com/v1/catalog/%s/songs/%s", storefront, id), nil)
 	if err != nil {
@@ -48,6 +52,7 @@ func GetSongResp(storefront string, id string, language string, token string) (*
 	if err != nil {
 		return nil, err
 	}
+	saveCachedJSON("song", obj, storefront, id, language)
 	return obj, nil
 }
 

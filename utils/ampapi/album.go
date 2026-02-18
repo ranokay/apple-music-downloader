@@ -17,6 +17,10 @@ func GetAlbumResp(storefront string, id string, language string, token string) (
 			return nil, err
 		}
 	}
+	cached := new(AlbumResp)
+	if hit, _ := loadCachedJSON("album", cached, storefront, id, language); hit {
+		return cached, nil
+	}
 
 	req, err := http.NewRequest("GET", fmt.Sprintf("https://amp-api.music.apple.com/v1/catalog/%s/albums/%s", storefront, id), nil)
 	if err != nil {
@@ -83,6 +87,7 @@ func GetAlbumResp(storefront string, id string, language string, token string) (
 			}
 		}
 	}
+	saveCachedJSON("album", obj, storefront, id, language)
 	return obj, nil
 }
 
@@ -95,6 +100,10 @@ func GetAlbumRespByHref(href string, language string, token string) (*AlbumResp,
 		}
 	}
 	href = strings.Split(href, "?")[0]
+	cached := new(AlbumResp)
+	if hit, _ := loadCachedJSON("album-by-href", cached, href, language); hit {
+		return cached, nil
+	}
 	req, err := http.NewRequest("GET", fmt.Sprintf("https://amp-api.music.apple.com%s/albums", href), nil)
 	if err != nil {
 		return nil, err
@@ -160,6 +169,7 @@ func GetAlbumRespByHref(href string, language string, token string) (*AlbumResp,
 			}
 		}
 	}
+	saveCachedJSON("album-by-href", obj, href, language)
 	return obj, nil
 }
 

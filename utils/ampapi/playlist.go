@@ -16,11 +16,24 @@ func GetPlaylistResp(storefront string, id string, language string, token string
 			return nil, err
 		}
 	}
+	cached := new(PlaylistResp)
+	if hit, _ := loadCachedJSON("playlist", cached, storefront, id, language, "artists,albums"); hit {
+		return cached, nil
+	}
+	if hit, _ := loadCachedJSON("playlist", cached, storefront, id, language, "artists"); hit {
+		return cached, nil
+	}
+
 	obj, err := getPlaylistRespWithInclude(storefront, id, language, token, "artists,albums")
-	if err == nil {
+	if err == nil && obj != nil {
+		saveCachedJSON("playlist", obj, storefront, id, language, "artists,albums")
 		return obj, nil
 	}
-	return getPlaylistRespWithInclude(storefront, id, language, token, "artists")
+	obj, err = getPlaylistRespWithInclude(storefront, id, language, token, "artists")
+	if err == nil && obj != nil {
+		saveCachedJSON("playlist", obj, storefront, id, language, "artists")
+	}
+	return obj, err
 }
 
 func getPlaylistRespWithInclude(storefront string, id string, language string, token string, includeSongs string) (*PlaylistResp, error) {

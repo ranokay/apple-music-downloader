@@ -25,6 +25,7 @@ import (
 
 	"main/utils/ampapi"
 	"main/utils/lyrics"
+	"main/utils/playlistdedupe"
 	"main/utils/runv2"
 	"main/utils/runv3"
 	"main/utils/structs"
@@ -40,12 +41,13 @@ import (
 )
 
 const (
-	envMetadataTagsM4a     = "AMR_METADATA_TAGS_M4A"
-	envMetadataTagsFlac    = "AMR_METADATA_TAGS_FLAC"
-	envSourceFormat        = "AMR_SOURCE_FORMAT"
-	maxCustomMetadataTags  = 30
-	maxCustomMetadataValue = 512
-	atmosMetadataPrefix    = "🄳 "
+	envMetadataTagsM4a        = "AMR_METADATA_TAGS_M4A"
+	envMetadataTagsFlac       = "AMR_METADATA_TAGS_FLAC"
+	envSourceFormat           = "AMR_SOURCE_FORMAT"
+	maxCustomMetadataTags     = 30
+	maxCustomMetadataValue    = 512
+	atmosMetadataPrefix       = "🄳 "
+	playlistDedupeToleranceMS = 2000
 )
 
 var knownMetadataTagIDsByContainer = map[string][]string{
@@ -128,6 +130,7 @@ var (
 	dl_preview                     bool
 	dl_lyrics_only                 bool
 	dl_covers_only                 bool
+	no_playlist_dedupe             bool
 	artist_select                  bool
 	debug_mode                     bool
 	select_tracks                  string
@@ -1556,13 +1559,22 @@ type PreviewTrack struct {
 }
 
 type PreviewPayload struct {
-	Kind        string         `json:"kind,omitempty"`
-	Artist      string         `json:"artist,omitempty"`
-	Title       string         `json:"title,omitempty"`
-	ReleaseType string         `json:"release_type,omitempty"`
-	TrackCount  int            `json:"track_count,omitempty"`
-	Tracks      []PreviewTrack `json:"tracks,omitempty"`
-	Preselected []int          `json:"preselected,omitempty"`
+	Kind               string         `json:"kind,omitempty"`
+	Artist             string         `json:"artist,omitempty"`
+	Title              string         `json:"title,omitempty"`
+	ReleaseType        string         `json:"release_type,omitempty"`
+	TrackCount         int            `json:"track_count,omitempty"`
+	OriginalTrackCount int            `json:"original_track_count,omitempty"`
+	DuplicatesRemoved  int            `json:"duplicates_removed,omitempty"`
+	Tracks             []PreviewTrack `json:"tracks,omitempty"`
+	Preselected        []int          `json:"preselected,omitempty"`
+}
+
+func dedupePlaylistTrackData(tracks []ampapi.TrackRespData) playlistdedupe.Result {
+	return playlistdedupe.DedupeTracks(tracks, playlistdedupe.Options{
+		Enabled:             !no_playlist_dedupe,
+		DurationToleranceMS: playlistDedupeToleranceMS,
+	})
 }
 
 // setDlFlags configures the global download flags based on the user's quality selection.
@@ -1801,8 +1813,10 @@ func buildPreviewPayload(rawUrl string, token string) (*PreviewPayload, error) {
 			return nil, err
 		}
 		meta := playlist.Data[0]
-		tracks := make([]PreviewTrack, 0, len(meta.Relationships.Tracks.Data))
-		for i, track := range meta.Relationships.Tracks.Data {
+		originalTrackCount := len(meta.Relationships.Tracks.Data)
+		dedupeResult := dedupePlaylistTrackData(meta.Relationships.Tracks.Data)
+		tracks := make([]PreviewTrack, 0, len(dedupeResult.Tracks))
+		for i, track := range dedupeResult.Tracks {
 			tracks = append(tracks, PreviewTrack{
 				Num:        i + 1,
 				Name:       track.Attributes.Name,
@@ -1817,14 +1831,19 @@ func buildPreviewPayload(rawUrl string, token string) (*PreviewPayload, error) {
 		if artistName == "" {
 			artistName = "Apple Music"
 		}
-		return &PreviewPayload{
+		payload := &PreviewPayload{
 			Kind:        "Playlist",
 			Artist:      artistName,
 			Title:       meta.Attributes.Name,
 			ReleaseType: "Playlists",
 			TrackCount:  len(tracks),
 			Tracks:      tracks,
-		}, nil
+		}
+		if dedupeResult.RemovedCount > 0 {
+			payload.OriginalTrackCount = originalTrackCount
+			payload.DuplicatesRemoved = dedupeResult.RemovedCount
+		}
+		return payload, nil
 	}
 
 	if storefront, songId := checkUrlSong(rawUrl); songId != "" {
@@ -3977,6 +3996,26 @@ func ripPlaylist(playlistId string, token string, storefront string, mediaUserTo
 		fmt.Println("Failed to get playlist response.")
 		return err
 	}
+	if len(playlist.Resp.Data) > 0 {
+		originalTrackCount := len(playlist.Resp.Data[0].Relationships.Tracks.Data)
+		dedupeResult := dedupePlaylistTrackData(playlist.Resp.Data[0].Relationships.Tracks.Data)
+		if dedupeResult.RemovedCount > 0 {
+			fmt.Printf("Playlist dedupe: %d -> %d (%d skipped)\n", originalTrackCount, len(dedupeResult.Tracks), dedupeResult.RemovedCount)
+			playlist.Resp.Data[0].Relationships.Tracks.Data = dedupeResult.Tracks
+			dedupedTracks := make([]task.Track, 0, len(dedupeResult.KeptIndexes))
+			for _, idx := range dedupeResult.KeptIndexes {
+				if idx >= 0 && idx < len(playlist.Tracks) {
+					dedupedTracks = append(dedupedTracks, playlist.Tracks[idx])
+				}
+			}
+			playlist.Tracks = dedupedTracks
+		}
+		total := len(playlist.Tracks)
+		for i := range playlist.Tracks {
+			playlist.Tracks[i].TaskNum = i + 1
+			playlist.Tracks[i].TaskTotal = total
+		}
+	}
 	meta := playlist.Resp
 	if debug_mode {
 		fmt.Println(meta.Data[0].Attributes.ArtistName)
@@ -4660,6 +4699,7 @@ func main() {
 	pflag.BoolVar(&dl_song, "song", false, "Enable single song download mode")
 	pflag.BoolVar(&dl_lyrics_only, "lyrics-only", false, "Download lyrics only (no audio)")
 	pflag.BoolVar(&dl_covers_only, "covers-only", false, "Download covers only (no audio)")
+	pflag.BoolVar(&no_playlist_dedupe, "no-playlist-dedupe", false, "Disable playlist pre-download deduplication")
 	pflag.BoolVar(&artist_select, "all-album", false, "Download all artist albums")
 	pflag.BoolVar(&debug_mode, "debug", false, "Enable debug mode to show audio quality information")
 	alac_max = pflag.Int("alac-max", Config.AlacMax, "Specify the max quality for download alac")
